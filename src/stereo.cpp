@@ -136,6 +136,7 @@ struct FlatEv {
     GLint sc[4] = {-1, -1, -1, -1};   // scissor box, -1 = off
     GLuint src[4] = {};       // render targets (game framebuffers) it samples
     int nsrc = 0;
+    bool clear = false;       // a clear of fb (no draw)
 };
 
 struct EyeState {
@@ -165,7 +166,11 @@ struct Ctx {
     size_t frameGroups = 0, lastGroupCount = 0;
     uint64_t groupKey = 0, groupKeyLast = 0;
     unsigned groupKeyFrame = 0;
-    std::unordered_map<uint64_t, float> keyDepth;   // smoothed 0 (last drawn, near) .. 1 (first, far)
+    struct KeyDepth {
+        float depth;          // smoothed 0 (last drawn, near) .. 1 (first, far)
+        unsigned frame;       // last frame it was drawn in
+    };
+    std::unordered_map<uint64_t, KeyDepth> keyDepth;
     float orderDepth = 0.0f;  // of the draw being issued
     float orderSlot = 0.0f;   // depth between neighbouring groups
     float drawPrims = 0.0f;   // triangles in the draw being issued (0 = unknown)
@@ -173,6 +178,8 @@ struct Ctx {
     std::unordered_map<GLuint, GLuint> texCopiedFrom;  // texture -> texture last glCopyImageSubData'd into it
     std::unordered_map<uint64_t, size_t> layoutPos;    // group key -> place in the last frame's composed picture
     size_t layoutCount = 0;                            // places in it (0 = far)
+    GLuint layoutLastFb = 0;                           // target and place of the last known group drawn
+    long long layoutLastG = -1;                        // in this frame (for groups new to the picture)
     // window / default framebuffer
     int winW = 0, winH = 0;
     unsigned stamp = 1;       // bumped on resize and texture/renderbuffer reallocation
@@ -759,15 +766,29 @@ void OrderDepthForDraw(Ctx* c)
     if (lt != c->layoutPos.end()) {
         g = lt->second;
         n = c->layoutCount;
+        if (c->drawFb == c->layoutLastFb) c->layoutLastG = (long long)g;
+    } else if (c->layoutCount > 1 && c->drawFb == c->layoutLastFb && c->layoutLastG >= 0) {
+        // not in the last frame's picture (an animated sprite shows another frame texture): right after
+        // the group drawn before it into the same target, on the same scale as the known ones
+        g = (size_t)std::min<long long>(c->layoutLastG + 1, (long long)c->layoutCount - 1);
+        n = c->layoutCount;
+    }
+    if (lt != c->layoutPos.end() || c->drawFb != c->layoutLastFb) {
+        c->layoutLastFb = c->drawFb;
+        c->layoutLastG = lt != c->layoutPos.end() ? (long long)lt->second : -1;
     }
     const float t = OrderT(g, n);
     c->orderSlot = n > 1 ? (g > 0 ? OrderT(g - 1, n) - t : t - OrderT(1, n)) : 0.0f;
+    // smoothed while the group keeps being drawn; a group back after a pause (an animated sprite's
+    // frame texture, shown again later) takes its depth right away, or it lags behind from long ago
     auto it = c->keyDepth.find(c->groupKey);
-    if (it == c->keyDepth.end()) it = c->keyDepth.emplace(c->groupKey, t).first;
-    else if (c->groupKeyFrame != g_frame || c->groupKeyLast != c->groupKey) it->second += (t - it->second) * 0.05f;
+    if (it == c->keyDepth.end()) it = c->keyDepth.emplace(c->groupKey, Ctx::KeyDepth{t, g_frame}).first;
+    else if (g_frame - it->second.frame > 2) it->second.depth = t;
+    else if (c->groupKeyFrame != g_frame || c->groupKeyLast != c->groupKey) it->second.depth += (t - it->second.depth) * 0.05f;
+    it->second.frame = g_frame;
     c->groupKeyFrame = g_frame;
     c->groupKeyLast = c->groupKey;
-    c->orderDepth = it->second;
+    c->orderDepth = it->second.depth;
     if (g_traceNow) Log("T %u.%u order group %zu/%zu prog %u tex %u target %.3f depth %.3f slot %.3f prims %.0f", g_frame, g_traceDraw, g, n,
                         c->program, ev.tex, t, c->orderDepth, c->orderSlot, c->drawPrims);
 }
@@ -835,6 +856,42 @@ void ComputeLayout(Ctx* c)
             }
         }
     }
+    // A scratch target, cleared and drawn again more than once in the frame (Astral Ascent renders
+    // every piece of text into one, glyph by glyph, and composites it): each use is one layer,
+    // placed where it is composited, or the glyphs of a line step forward one after another.
+    std::unordered_map<GLuint, int> uses;
+    {
+        std::unordered_map<GLuint, bool> drawn;   // drawn into since its last clear
+        for (const FlatEv& e : ev) {
+            if (e.clear) {
+                drawn[e.fb] = false;
+            } else if (e.key && !drawn[e.fb]) {
+                drawn[e.fb] = true;
+                uses[e.fb]++;
+            }
+        }
+    }
+    std::string scratch;
+    {
+        std::unordered_map<GLuint, uint64_t> first;   // first layer of the current use
+        for (const FlatEv& e : ev) {
+            if (uses[e.fb] < 2) continue;
+            if (e.clear) {
+                first.erase(e.fb);
+                continue;
+            }
+            if (!e.key) continue;
+            auto f = first.find(e.fb);
+            if (f == first.end()) {
+                auto a = alias.find(e.key);
+                first[e.fb] = a != alias.end() ? a->second : e.key;
+            } else if (e.key != f->second && !alias.count(e.key)) {
+                alias[e.key] = f->second;
+            }
+        }
+        for (auto& u : uses)
+            if (u.second >= 2) scratch += " fb" + std::to_string(u.first) + "x" + std::to_string(u.second);
+    }
     // the picture is the target drawn last (trailing copies to the window carry no layers)
     GLuint root = ev.back().fb;
     for (size_t i = ev.size(); i-- > 0;)
@@ -854,7 +911,7 @@ void ComputeLayout(Ctx* c)
     if (g_traceNow) {
         std::string s, comp;
         for (const FlatEv& e : ev) {   // composites and copies, to see where the walk stops
-            if (e.key) continue;
+            if (e.key || e.clear) continue;
             char buf[48];
             sprintf_s(buf, " fb%u<", e.fb);
             comp += buf;
@@ -863,7 +920,8 @@ void ComputeLayout(Ctx* c)
                 comp += buf;
             }
         }
-        Log("T %u layout events %zu, root fb%u, composites/copies:%s", g_frame, ev.size(), root, comp.c_str());
+        Log("T %u layout events %zu, root fb%u, scratch targets:%s, composites/copies:%s", g_frame, ev.size(), root,
+            scratch.empty() ? " -" : scratch.c_str(), comp.c_str());
         for (size_t k = 0; k < n; ++k) {
             for (const FlatEv& e : ev)
                 if (e.key == order[k]) {
@@ -1076,6 +1134,12 @@ void StereoTargetOp(F&& op)
     }
     std::lock_guard<std::recursive_mutex> lk(g_lock);
     if (c->drawFb == 0) c->fb0Touched = true;
+    if (g_cfg.flatEnable && g_cfg.flatRule == 1 && c->isMain) {   // for scratch targets (ComputeLayout)
+        FlatEv ev;
+        ev.fb = c->drawFb;
+        ev.clear = true;
+        c->flatEvents.push_back(ev);
+    }
     op();
     GLuint right = Active(c) ? RightFor(c, c->drawFb) : 0;
     if (!right) return;
@@ -3945,6 +4009,8 @@ bool OnSwapBuffers(HDC dc)
     if (c->frameGroups) c->lastGroupCount = c->frameGroups;
     ComputeLayout(c);
     c->frameGroups = 0;
+    c->layoutLastFb = 0;
+    c->layoutLastG = -1;
     c->groupId = 0;
     c->groupIds.clear();
     if (c->keyDepth.size() > 4096) c->keyDepth.clear();
