@@ -146,6 +146,17 @@ void LoadConfig()
     c.fixedFunction = IniInt(L"Stereo", L"fixed_function", c.fixedFunction) != 0;
     c.orthoDepth = IniFloat(L"Stereo", L"ortho_depth", c.orthoDepth);
     c.orthoConvergence = IniFloat(L"Stereo", L"ortho_convergence", c.orthoConvergence);
+    c.flatEnable = IniInt(L"Flat", L"enable", c.flatEnable) != 0;
+    c.flatRule = IniStr(L"Flat", L"rule", L"feet") == L"order" ? 1 : 0;
+    c.flatTop = IniFloat(L"Flat", L"depth_top", c.flatTop);
+    c.flatZero = IniFloat(L"Flat", L"depth_screen", c.flatZero);
+    c.flatPlane = IniFloat(L"Flat", L"plane_size", c.flatPlane);
+    c.flatPlaneHeight = IniFloat(L"Flat", L"plane_height", c.flatPlaneHeight);
+    c.flatSpriteMin = IniFloat(L"Flat", L"sprite_min", c.flatSpriteMin);
+    c.flatScreenBatch = IniInt(L"Flat", L"screen_batch", c.flatScreenBatch);
+    c.flatCacheScale = IniFloat(L"Flat", L"cache_scale", c.flatCacheScale);
+    c.flatGroupByDraw = _wcsicmp(IniStr(L"Flat", L"group", L"texture").c_str(), L"draw") == 0;
+    c.flatOrderCurve = IniFloat(L"Flat", L"order_curve", c.flatOrderCurve);
     c.inject = IniInt(L"Inject", L"enable", c.inject) != 0;
     c.blockProgramBinary = IniInt(L"Inject", L"block_program_binary", c.blockProgramBinary) != 0;
     c.dumpShaders = IniInt(L"Inject", L"dump_shaders", c.dumpShaders) != 0;
@@ -165,6 +176,7 @@ void LoadConfig()
     c.keyHuntPrev = ParseKey(IniStr(L"Keys", L"hunt_prev", L""), c.keyHuntPrev);
     c.keyHuntNext = ParseKey(IniStr(L"Keys", L"hunt_next", L""), c.keyHuntNext);
     c.keyHuntMode = ParseKey(IniStr(L"Keys", L"hunt_mode", L""), c.keyHuntMode);
+    c.swallowKeys = IniInt(L"Keys", L"swallow", c.swallowKeys) != 0;
     c.showValues = IniInt(L"Overlay", L"show_values", c.showValues) != 0;
     c.dpiAware = IniInt(L"Display", L"dpi_aware", c.dpiAware) != 0;
     c.upscale = IniInt(L"Display", L"upscale", c.upscale) != 0;
@@ -192,6 +204,10 @@ void LoadConfig()
     std::wstring df = IniStr(L"Debug", L"dump_frames", L"");
     c.dumpFrames.clear();
     for (wchar_t ch : df) c.dumpFrames += (char)(ch < 128 ? ch : '?');
+    std::wstring tf = IniStr(L"Debug", L"trace_frames", L"");
+    c.traceFrames.clear();
+    for (wchar_t ch : tf) c.traceFrames += (char)(ch < 128 ? ch : '?');
+    c.traceSteps = IniInt(L"Debug", L"trace_steps", c.traceSteps) != 0;
     c.statsEvery = IniInt(L"Debug", L"stats_every", c.statsEvery);
     c.logCrashes = IniInt(L"Debug", L"log_crashes", c.logCrashes) != 0;
     c.flickerProbe = IniInt(L"Debug", L"flicker_probe", c.flickerProbe) != 0;
@@ -201,6 +217,9 @@ void LoadConfig()
         "mono_w1=%d inject=%d block_binary=%d shader_overrides=%zu",
         c.enable, c.separation, c.maxSeparation, c.convergence, c.autoConvergence ? " (auto)" : "", c.output,
         c.swapEyes, c.monoW1, c.inject, c.blockProgramBinary, c.overrides.size());
+    if (c.flatEnable)
+        Log("flat depth: rule=%s top=%.2f screen=%.2f plane=%.2fx%.2f sprite_min=%.2f screen_batch=%d", c.flatRule ? "order" : "feet", c.flatTop, c.flatZero,
+            c.flatPlane, c.flatPlaneHeight, c.flatSpriteMin, c.flatScreenBatch);
 }
 
 const wchar_t* ModeName(int mode)
@@ -230,6 +249,10 @@ void SaveStereoValues()
     if (g_cfg.autoConvergence) wcscpy_s(buf, L"auto");
     else swprintf_s(buf, L"%.4f", g_cfg.convergence);
     WritePrivateProfileStringW(L"Stereo", L"convergence", buf, IniPath().c_str());
+    if (g_cfg.flatEnable) {
+        swprintf_s(buf, L"%.3f", g_cfg.flatZero);
+        WritePrivateProfileStringW(L"Flat", L"depth_screen", buf, IniPath().c_str());
+    }
     // the whole [ShaderOverride] section is rewritten: "hash=mode\0...\0\0"
     std::wstring sec;
     for (const auto& kv : g_cfg.overrides) {
@@ -290,9 +313,27 @@ extern "C" void* __cdecl S3D_ResolveForward(unsigned idx)
 
 extern "C" {
 
+// GL 1.1 functions we implement as exports (src/exports_impl.txt). Loaders such as glad behind
+// SDL_GL_GetProcAddress (AGS 3.6) ask wglGetProcAddress for these as well, and NVIDIA answers with
+// the driver's own entry point, which would bypass the wrapper: hand out our export instead.
+static const char* const kOwnGl11[] = {
+    "glDrawArrays", "glDrawElements", "glClear", "glBindTexture", "glDeleteTextures", "glTexImage2D",
+    "glTexSubImage2D", "glCopyTexImage2D", "glCopyTexSubImage2D", "glTexParameteri", "glTexParameterf",
+    "glTexParameteriv", "glTexParameterfv", "glDrawBuffer", "glReadBuffer", "glGetIntegerv", "glBegin",
+    "glEnd", "glNewList", "glEndList", "glCallList", "glCallLists", "glFlush", "glFinish", "glScissor", "glViewport",
+};
+
 PROC WINAPI H_wglGetProcAddress(LPCSTR name)
 {
     RealOpenGL();
+    if ((uintptr_t)name > 0xFFFF && name[0] == 'g' && name[1] == 'l') {
+        for (const char* own : kOwnGl11) {
+            if (strcmp(own, name) != 0) continue;
+            PROC p = GetProcAddress(g_self, name);
+            LOGV("wglGetProcAddress(%s) = own export %p", name, p);
+            if (p) return p;
+        }
+    }
     PROC p = R.wglGetProcAddress(name);
     PROC h = HookForName(name, p);
     LOGV("wglGetProcAddress(%s) = %p%s", name, p, h != p ? " [hooked]" : "");

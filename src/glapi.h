@@ -179,6 +179,21 @@ enum : GLenum {
     GL_ALREADY_SIGNALED = 0x911A,
     GL_TIMEOUT_EXPIRED = 0x911B,
     GL_CONDITION_SATISFIED = 0x911C,
+    // draw trace
+    GL_SCISSOR_BOX = 0x0C10,
+    GL_ACTIVE_UNIFORMS = 0x8B86,
+    GL_FLOAT_MAT4 = 0x8B5C,
+    GL_TEXTURE_BINDING_2D = 0x8069,
+    GL_GEOMETRY_SHADER = 0x8DD9,
+    GL_CLIP_ORIGIN = 0x935C,
+    GL_CLIP_DEPTH_MODE = 0x935D,
+    GL_LOWER_LEFT = 0x8CA1,
+    GL_NEGATIVE_ONE_TO_ONE = 0x935E,
+    GL_TEXTURE_IMMUTABLE_FORMAT = 0x912F,
+    GL_TEXTURE_IMMUTABLE_LEVELS = 0x82DF,
+    GL_ATTACHED_SHADERS = 0x8B85,
+    GL_TRIANGLES = 0x0004,
+    GL_TRIANGLE_FAN = 0x0006,
 };
 
 constexpr GLuint64 GL_TIMEOUT_IGNORED = 0xFFFFFFFFFFFFFFFFull;
@@ -235,6 +250,7 @@ constexpr int kMaxUnits = 32;
     X(void, PushClientAttrib, (GLbitfield mask))                                                     \
     X(void, PopClientAttrib, ())                                                                     \
     X(void, Viewport, (GLint x, GLint y, GLsizei w, GLsizei h))                                      \
+    X(void, Scissor, (GLint x, GLint y, GLsizei w, GLsizei h))                                       \
     X(void, DepthMask, (GLboolean flag))                                                             \
     X(void, BlendFunc, (GLenum src, GLenum dst))                                                     \
     X(void, PolygonMode, (GLenum face, GLenum mode))                                                 \
@@ -339,7 +355,23 @@ constexpr int kMaxUnits = 32;
     X(void, ClearBufferuiv, (GLenum buf, GLint drawbuf, const GLuint* v))                            \
     X(void, ClearBufferfi, (GLenum buf, GLint drawbuf, GLfloat d, GLint s))                          \
     X(HGLRC, wglCreateContextAttribsARB, (HDC dc, HGLRC share, const int* attribs))                  \
-    X(BOOL, wglSwapIntervalEXT, (int interval))
+    X(BOOL, wglSwapIntervalEXT, (int interval))                                                      \
+    X(void, GetActiveUniform, (GLuint prog, GLuint index, GLsizei bufSize, GLsizei* length, GLint* size,\
+                               GLenum* type, GLchar* name))                                          \
+    X(void, GetUniformfv, (GLuint prog, GLint loc, GLfloat* params))                                     X(void, GetUniformiv, (GLuint prog, GLint loc, GLint* params))                                   \
+    X(void, DetachShader, (GLuint prog, GLuint sh))                                                  \
+    X(void, ClipControl, (GLenum origin, GLenum depth))                                              \
+    X(void, TextureView, (GLuint tex, GLenum target, GLuint orig, GLenum ifmt, GLuint minLevel,      \
+                          GLuint numLevels, GLuint minLayer, GLuint numLayers))                                                  \
+    X(void, DrawArraysInstancedBaseInstance, (GLenum mode, GLint first, GLsizei count, GLsizei inst, GLuint bi))\
+    X(void, DrawElementsInstancedBaseInstance, (GLenum mode, GLsizei count, GLenum type, const void* idx,\
+                                                GLsizei inst, GLuint bi))                            \
+    X(void, DrawElementsInstancedBaseVertexBaseInstance, (GLenum mode, GLsizei count, GLenum type,   \
+                                                          const void* idx, GLsizei inst, GLint bv, GLuint bi))\
+    X(void, DrawArraysIndirect, (GLenum mode, const void* ind))                                      \
+    X(void, DrawElementsIndirect, (GLenum mode, GLenum type, const void* ind))                       \
+    X(void, MultiDrawArraysIndirect, (GLenum mode, const void* ind, GLsizei n, GLsizei stride))      \
+    X(void, MultiDrawElementsIndirect, (GLenum mode, GLenum type, const void* ind, GLsizei n, GLsizei stride))
 
 struct RealGL {
 #define S3D_DECL(ret, name, args) ret(GLAPIENTRY* name) args = nullptr;

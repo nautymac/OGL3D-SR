@@ -259,7 +259,7 @@ EXPORTS
     glRotatef @256
     glScaled @257
     glScalef @258
-    glScissor @259
+    glScissor = H_glScissor @259
     glSelectBuffer @260
     glShadeModel @261
     glStencilFunc @262
@@ -343,7 +343,7 @@ EXPORTS
     glVertex4s @340
     glVertex4sv @341
     glVertexPointer @342
-    glViewport @343
+    glViewport = H_glViewport @343
     wglChoosePixelFormat @344
     wglCopyContext @345
     wglCreateContext = H_wglCreateContext @346

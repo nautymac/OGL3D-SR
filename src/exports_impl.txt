@@ -31,3 +31,5 @@ glCallLists
 wglSwapMultipleBuffers
 glFlush
 glFinish
+glScissor
+glViewport

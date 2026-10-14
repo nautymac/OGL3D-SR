@@ -16,6 +16,8 @@
 #include <climits>
 #include <cmath>
 #include <initializer_list>
+#include <iterator>
+#include <map>
 #include <cstdio>
 #include <cstring>
 #include <condition_variable>
@@ -64,6 +66,11 @@ struct TexInfo {
     int levels = 1;           // mip levels the game allocated
     bool immutable = false;   // glTexStorage2D
     GLuint right = 0;         // right-eye clone
+    // glTextureView (WineD3D's shader resource views): a view of another texture's storage; its
+    // right-eye twin is the same view of that texture's clone
+    GLuint viewOf = 0;
+    GLenum viewFmt = 0;
+    GLuint minLevel = 0, numLevels = 1, minLayer = 0, numLayers = 1;
 };
 
 struct RbInfo {
@@ -79,6 +86,16 @@ struct ProgInfo {
     unsigned ver = 0;
     uint32_t hash = 0;        // of the attached shaders' original sources ([ShaderOverride] key)
     int mode = kModeStereo;
+    bool gs = false;          // flat depth geometry shader attached ([Flat])
+    GLint locF = -1, locD = -1;
+    unsigned fVer = 0;
+    float lastD[4] = {NAN, NAN, NAN, NAN};   // s3d_D last written
+    // texture units its samplers read (SampledUnits); read once at its first draw, after the engine
+    // has set the sampler uniforms
+    bool samplersKnown = false;
+    std::vector<GLint> samplerLocs;
+    bool unitsRead = false;
+    uint32_t units = ~0u;
 };
 
 struct Att {
@@ -103,8 +120,22 @@ struct FboInfo {
     GLuint right = 0;
     bool dirty = true;
     bool stereo = false;
+    // flat depth: an off-screen layer cache (not the window's aspect) whose image is drawn into the
+    // stereo scene; it is stereo so the layers drawn into it keep their own depths
+    bool promoted = false;
     unsigned stamp = 0;       // Ctx::stamp the classification was made for
     int w = 0, h = 0;
+};
+
+// flat depth, rule = order: one draw of the frame, for the composition order of the next frame
+struct FlatEv {
+    GLuint fb = 0;
+    uint64_t key = 0;         // layer group; 0 = a composite (draws a stereo render target)
+    GLuint prog = 0, tex = 0;
+    GLsizei count = -1;
+    GLint sc[4] = {-1, -1, -1, -1};   // scissor box, -1 = off
+    GLuint src[4] = {};       // render targets (game framebuffers) it samples
+    int nsrc = 0;
 };
 
 struct EyeState {
@@ -123,6 +154,25 @@ struct Ctx {
     int maxUnit = 0;
     GLuint bound[kMaxUnits][kSlotCount] = {};
     GLenum listMode = 0;      // the game's glNewList mode while it compiles a list
+    // scissor/viewport batches of the current frame (flat depth: later batches are UI)
+    int batch = 0;
+    unsigned drawsInBatch = 0;
+    GLuint batchFb = 0;       // framebuffer the current batch draws into
+    bool batchPending = false;
+    // flat depth, rule = order: groups of consecutive draws with one program, in drawing order
+    uint64_t groupId = 0;             // (program, texture) of the current group
+    std::vector<uint64_t> groupIds;
+    size_t frameGroups = 0, lastGroupCount = 0;
+    uint64_t groupKey = 0, groupKeyLast = 0;
+    unsigned groupKeyFrame = 0;
+    std::unordered_map<uint64_t, float> keyDepth;   // smoothed 0 (last drawn, near) .. 1 (first, far)
+    float orderDepth = 0.0f;  // of the draw being issued
+    float orderSlot = 0.0f;   // depth between neighbouring groups
+    float drawPrims = 0.0f;   // triangles in the draw being issued (0 = unknown)
+    std::vector<FlatEv> flatEvents;                    // this frame's draws
+    std::unordered_map<GLuint, GLuint> texCopiedFrom;  // texture -> texture last glCopyImageSubData'd into it
+    std::unordered_map<uint64_t, size_t> layoutPos;    // group key -> place in the last frame's composed picture
+    size_t layoutCount = 0;                            // places in it (0 = far)
     // window / default framebuffer
     int winW = 0, winH = 0;
     unsigned stamp = 1;       // bumped on resize and texture/renderbuffer reallocation
@@ -196,6 +246,45 @@ std::unordered_map<GLuint, std::string> g_injectedSrc;   // original source of r
 std::unordered_map<GLuint, uint32_t> g_shaderHash;       // shader object -> hash of its original source
 std::unordered_map<HGLRC, Ctx*> g_ctx;
 thread_local Ctx* t_ctx;
+thread_local GLenum t_drawMode = 0x0004;   // primitive mode of the draw being issued
+thread_local GLsizei t_drawCount = -1;     // its vertex/index count (-1 = unknown)
+thread_local bool t_ownShaders;            // the SR runtime is creating its shaders: leave them alone
+extern bool g_traceNow;
+extern unsigned g_traceDraw;
+
+bool SrAvailableOwn(HWND hwnd)
+{
+    t_ownShaders = true;
+    bool ok = SrAvailable(hwnd);
+    t_ownShaders = false;
+    return ok;
+}
+std::unordered_map<GLuint, VsInfo> g_vsInfo;       // vertex shaders whose outputs were renamed for the flat GS
+std::unordered_map<GLuint, std::string> g_vsPlain; // ... and their injected source without renaming
+// generated geometry shader (context, source) -> shader object. Per context: WineD3D deletes its first
+// contexts and makes an unshared one, where the same names belong to other objects.
+std::map<std::pair<HGLRC, std::string>, GLuint> g_flatGs;
+std::unordered_set<GLuint> g_vsBad;                // vertex shaders flat depth could not analyse
+
+// Outputs of several vertex shader pieces of one program, each name once.
+void MergeVsInfo(VsInfo& into, const VsInfo& add)
+{
+    into.version = std::max(into.version, add.version);
+    into.core = into.core && add.core;
+    for (const VsOutput& o : add.outs) {
+        bool have = false;
+        for (const VsOutput& e : into.outs) have |= e.name == o.name;
+        if (!have) into.outs.push_back(o);
+    }
+    for (const VsBlock& b : add.blocks) {
+        bool have = false;
+        for (const VsBlock& e : into.blocks) have |= e.name == b.name;
+        if (!have) into.blocks.push_back(b);
+    }
+    into.builtins |= add.builtins;
+    into.texCoords = std::max(into.texCoords, add.texCoords);
+    into.clipDistances = std::max(into.clipDistances, add.clipDistances);
+}
 HGLRC g_mainRc;
 unsigned g_paramVer = 1;
 unsigned g_frame;
@@ -243,6 +332,11 @@ bool QueryTex(Ctx* c, GLuint id, GLenum target, TexInfo& ti)
     R.GetTexLevelParameteriv(target, 0, GL_TEXTURE_HEIGHT, &h);
     R.GetTexLevelParameteriv(target, 0, GL_TEXTURE_INTERNAL_FORMAT, &f);
     if (target == GL_TEXTURE_2D_MULTISAMPLE) R.GetTexLevelParameteriv(target, 0, GL_TEXTURE_SAMPLES, &s);
+    GLint imm = 0, immLevels = 0;
+    if (target != GL_TEXTURE_2D_MULTISAMPLE) {
+        R.GetTexParameteriv(target, GL_TEXTURE_IMMUTABLE_FORMAT, &imm);
+        if (imm) R.GetTexParameteriv(target, GL_TEXTURE_IMMUTABLE_LEVELS, &immLevels);
+    }
     R.BindTexture(target, c->bound[c->activeUnit][slot]);
     if (w <= 0 || h <= 0) return false;
     ti.target = target;
@@ -250,6 +344,8 @@ bool QueryTex(Ctx* c, GLuint id, GLenum target, TexInfo& ti)
     ti.h = h;
     ti.ifmt = (GLenum)f;
     ti.samples = s;
+    ti.immutable = imm != 0;
+    if (imm && immLevels > 0) ti.levels = immLevels;
     if (IsDepthFormat(ti.ifmt)) ti.fmt = GL_DEPTH_COMPONENT, ti.type = GL_FLOAT;
     else if (IsDepthStencilFormat(ti.ifmt)) ti.fmt = GL_DEPTH_STENCIL, ti.type = GL_UNSIGNED_INT_24_8;
     LOGV("queried texture %u: %dx%d fmt 0x%x", id, w, h, f);
@@ -283,6 +379,19 @@ GLuint TexClone(Ctx* c, GLuint id, GLenum targetHint)
         ti = &(g_tex[id] = q);
     }
     if (ti->right) return ti->right;
+    if (ti->viewOf) {
+        // the same view of the original's clone
+        TexInfo* oi = FindTex(ti->viewOf);
+        GLuint origRight = oi ? TexClone(c, ti->viewOf, oi->target) : 0;
+        if (!origRight || !R.TextureView) return 0;
+        GLuint view = 0;
+        R.GenTextures(1, &view);
+        R.TextureView(view, ti->target, origRight, ti->viewFmt, ti->minLevel, ti->numLevels, ti->minLayer, ti->numLayers);
+        ti = FindTex(id);   // TexClone above may have rehashed g_tex
+        ti->right = view;
+        LOGV("texture view %u (of %u) -> right view %u", id, ti->viewOf, view);
+        return view;
+    }
     int slot = SlotOf(ti->target);
     if (slot < 0 || ti->w <= 0) return 0;
 
@@ -435,9 +544,9 @@ GLuint RightFor(Ctx* c, GLuint fb)
     bool sized = false;
     for (int i = 0; i < kAttCount && !sized; ++i)
         if (f.att[i].kind) sized = AttSize(c, f.att[i], w, h);
-    bool stereo = sized && IsStereoSize(c, w, h);
+    bool stereo = sized && (IsStereoSize(c, w, h) || f.promoted);
     if (stereo != f.stereo || w != f.w || h != f.h)
-        Log("fbo %u: %dx%d -> %s", fb, w, h, stereo ? "stereo" : "mono");
+        Log("fbo %u: %dx%d -> %s", fb, w, h, stereo ? (f.promoted ? "stereo (a layer cache drawn into the stereo scene)" : "stereo") : "mono");
     f.stereo = stereo;
     f.w = w;
     f.h = h;
@@ -512,6 +621,275 @@ ProgInfo* FindProg(GLuint p)
     return it == g_prog.end() ? nullptr : &it->second;
 }
 
+// Flat depth, rule = order: 2D engines draw back to front. Consecutive draws with the same program
+// and texture form a layer group (a background atlas, a tilemap batch, the sprites, the HUD);
+// groups get depth by their position in the frame (first = far, last = screen). Each group is
+// smoothed under the key (program, texture, how many such groups came before it), so depth does not
+// jump when effects add or drop a group.
+bool SamplesStereoTarget(Ctx* c);
+
+// The game framebuffers that render into texture tex (a color attachment); WineD3D may have
+// several with the same colour texture (other depth buffers), and attaches views of it (render
+// target views), so attachments count by the texture they view.
+int FbosOfTexture(Ctx* c, GLuint tex, GLuint* out, int max)
+{
+    int n = 0;
+    for (auto& kv : c->fbo)
+        for (int i = 0; i < kMaxColorAttachments && n < max; ++i) {
+            const Att& a = kv.second.att[i];
+            if (a.kind != GL_TEXTURE) continue;
+            GLuint id = a.id;
+            if (id != tex) {
+                TexInfo* ti = FindTex(id);
+                if (ti && ti->viewOf) id = ti->viewOf;
+            }
+            if (id == tex) {
+                out[n++] = kv.first;
+                break;
+            }
+        }
+    return n;
+}
+
+// Texture units the current program samples, one bit each (all when unknown). WineD3D leaves the
+// render targets of earlier passes bound on units the shader does not read: counted, they made
+// ordinary sprites look like composite passes (no depth) in Huntdown.
+uint32_t SampledUnits(Ctx* c)
+{
+    ProgInfo* pi = c->program ? FindProg(c->program) : nullptr;
+    if (!pi || !pi->samplersKnown || !R.GetUniformiv) return ~0u;
+    if (!pi->unitsRead) {
+        uint32_t m = 0;
+        for (GLint loc : pi->samplerLocs) {
+            GLint u = -1;
+            R.GetUniformiv(c->program, loc, &u);
+            if (u >= 0 && u < 32) m |= 1u << u;
+        }
+        pi->units = m;
+        pi->unitsRead = true;
+    }
+    return pi->units;
+}
+
+static bool UnitIn(uint32_t units, int u) { return u >= 32 ? units == ~0u : ((units >> u) & 1) != 0; }
+
+// Order rule: depth of the k-th of n layers, 1 (first drawn, far) .. 0 (last); order_curve < 1 gives the
+// first layers (backgrounds, usually several parallax planes) more of the depth range
+float OrderT(size_t k, size_t n)
+{
+    if (n < 2) return 0.0f;
+    const float x = std::min(1.0f, (float)k / (float)(n - 1));
+    return 1.0f - (g_cfg.flatOrderCurve == 1.0f ? x : std::pow(x, std::max(0.05f, g_cfg.flatOrderCurve)));
+}
+
+void OrderDepthForDraw(Ctx* c)
+{
+    FlatEv ev;
+    ev.fb = c->drawFb;
+    ev.prog = c->program;
+    // the texture it draws with: engines put it on any unit (Huntdown under WineD3D keeps a 0x0
+    // placeholder on unit 0 and the sprite atlas on another one); the group key takes all of them
+    uint64_t texKey = 0;
+    const uint32_t units = SampledUnits(c);
+    for (int u = 0; u <= c->maxUnit; ++u) {
+        if (!UnitIn(units, u)) continue;
+        const GLuint id = c->bound[u][kSlot2D];
+        texKey = texKey * 0x100000001B3ull ^ id;
+        if (id && !ev.tex) {
+            TexInfo* ti = FindTex(id);
+            if (ti && ti->w > 0) ev.tex = id;
+        }
+    }
+    if (!ev.tex) ev.tex = c->bound[0][kSlot2D];
+    ev.count = t_drawCount;
+    t_drawCount = -1;
+    c->drawPrims = ev.count <= 0 ? 0.0f : (float)(t_drawMode == GL_TRIANGLES ? ev.count / 3 : std::max(ev.count - 2, 0));
+    if (R.IsEnabled(GL_SCISSOR_TEST)) R.GetIntegerv(GL_SCISSOR_BOX, ev.sc);
+    // render targets this draw samples; a mono one drawn into the stereo scene is an off-screen layer
+    // cache (Door Kickers: Action Squad renders the whole level into a low-resolution 1024x1024
+    // target first): make it stereo, or every layer in it would end up at one depth
+    const bool toStereo = Active(c) && RightFor(c, c->drawFb) != 0;
+    for (int u = 0; u <= c->maxUnit; ++u) {
+        GLuint id = c->bound[u][kSlot2D];
+        if (!id || !UnitIn(units, u)) continue;
+        TexInfo* ti = FindTex(id);
+        GLuint base = ti && ti->viewOf ? ti->viewOf : id;
+        GLuint fbs[4];
+        int nfb = FbosOfTexture(c, base, fbs, 4);
+        // a copy of a render target (WineD3D resolves the scene with glCopyImageSubData): its source
+        for (GLuint t = base, hops = 0; !nfb && hops < 3; ++hops) {
+            auto cf = c->texCopiedFrom.find(t);
+            if (cf == c->texCopiedFrom.end()) break;
+            t = cf->second;
+            nfb = FbosOfTexture(c, t, fbs, 4);
+        }
+        for (int k = 0; k < nfb; ++k) {
+            const GLuint fb = fbs[k];
+            if (fb == c->drawFb) continue;
+            if (ev.nsrc < 4 && std::find(ev.src, ev.src + ev.nsrc, fb) == ev.src + ev.nsrc) ev.src[ev.nsrc++] = fb;
+            FboInfo& f = c->fbo[fb];
+            // only a target drawn into in this frame is a layer cache: WineD3D also attaches ordinary
+            // textures (sprite atlases) to its own framebuffers to upload or clear them
+            if (toStereo && !f.promoted && !f.stereo &&
+                std::any_of(c->flatEvents.begin(), c->flatEvents.end(), [fb](const FlatEv& e) { return e.fb == fb && e.key; })) {
+                f.promoted = true;
+                f.dirty = true;
+                Log("flat depth: fbo %u (texture %u) is drawn into the stereo scene: layer cache", fb, base);
+            }
+        }
+    }
+    if (SamplesStereoTarget(c)) {   // composite pass: stays at the screen
+        c->flatEvents.push_back(ev);
+        return;
+    }
+    const uint64_t id = ((uint64_t)c->program << 32) ^ texKey;
+    if (id != c->groupId || c->frameGroups == 0 || g_cfg.flatGroupByDraw) {
+        c->groupId = id;
+        int seen = 0;
+        for (uint64_t g : c->groupIds) seen += g == id;
+        c->groupIds.push_back(id);
+        c->groupKey = (id * 0x9E3779B97F4A7C15ull) ^ (uint64_t)seen;
+        c->frameGroups++;
+    }
+    ev.key = c->groupKey;
+    c->flatEvents.push_back(ev);
+    size_t g = c->frameGroups - 1;
+    size_t n = std::max(c->lastGroupCount, c->frameGroups);
+    auto lt = c->layoutPos.find(c->groupKey);   // its place in the composed picture, when known
+    if (lt != c->layoutPos.end()) {
+        g = lt->second;
+        n = c->layoutCount;
+    }
+    const float t = OrderT(g, n);
+    c->orderSlot = n > 1 ? (g > 0 ? OrderT(g - 1, n) - t : t - OrderT(1, n)) : 0.0f;
+    auto it = c->keyDepth.find(c->groupKey);
+    if (it == c->keyDepth.end()) it = c->keyDepth.emplace(c->groupKey, t).first;
+    else if (c->groupKeyFrame != g_frame || c->groupKeyLast != c->groupKey) it->second += (t - it->second) * 0.05f;
+    c->groupKeyFrame = g_frame;
+    c->groupKeyLast = c->groupKey;
+    c->orderDepth = it->second;
+    if (g_traceNow) Log("T %u.%u order group %zu/%zu prog %u tex %u target %.3f depth %.3f slot %.3f prims %.0f", g_frame, g_traceDraw, g, n,
+                        c->program, ev.tex, t, c->orderDepth, c->orderSlot, c->drawPrims);
+}
+
+// Painter's order of the composed picture: walks the framebuffer drawn last; a composite pass stands
+// for the layers drawn into the targets it samples (before it), so a layer cache drawn first but
+// composited over the background sits in front of that background.
+static void WalkLayout(const std::vector<FlatEv>& ev, const std::unordered_map<uint64_t, uint64_t>& alias, GLuint fb,
+                       size_t end, int depth, std::vector<uint64_t>& order)
+{
+    for (size_t i = 0; i < end; ++i) {
+        const FlatEv& e = ev[i];
+        if (e.fb != fb) continue;
+        if (e.key) {
+            auto a = alias.find(e.key);
+            uint64_t k = a != alias.end() ? a->second : e.key;
+            if (std::find(order.begin(), order.end(), k) == order.end()) order.push_back(k);
+        } else if (depth < 6) {
+            for (int s = 0; s < e.nsrc; ++s) WalkLayout(ev, alias, e.src[s], i, depth + 1, order);
+        }
+    }
+}
+
+// At the end of a frame: the depth of each layer group from where it lands in the composed picture.
+void ComputeLayout(Ctx* c)
+{
+    std::vector<FlatEv>& ev = c->flatEvents;
+    c->layoutPos.clear();
+    c->layoutCount = 0;
+    if (ev.empty()) return;
+    // A run of groups drawn again into another region of the same target (deferred lighting draws the
+    // tiles once for colour, once for normals) repeats an earlier run: same program and draw counts.
+    // It takes that run's depths, or the lighting would not line up with the colour in one eye.
+    std::unordered_map<uint64_t, uint64_t> alias;
+    std::vector<size_t> starts;
+    for (size_t i = 0; i < ev.size(); ++i)
+        if (ev[i].key && (i == 0 || ev[i - 1].key != ev[i].key || ev[i - 1].fb != ev[i].fb)) starts.push_back(i);
+    size_t cursor = SIZE_MAX;
+    for (size_t s = 0; s < starts.size(); ++s) {
+        const FlatEv& e = ev[starts[s]];
+        if (cursor != SIZE_MAX && cursor < s) {
+            const FlatEv& p = ev[starts[cursor]];
+            if (p.fb == e.fb && p.prog == e.prog && p.count == e.count && p.key != e.key) {
+                auto a = alias.find(p.key);
+                alias[e.key] = a != alias.end() ? a->second : p.key;
+                ++cursor;
+                continue;
+            }
+            cursor = SIZE_MAX;
+        }
+        if (e.count <= 12 || e.sc[2] < 0) continue;
+        for (size_t q = 0; q < s; ++q) {
+            const FlatEv& p = ev[starts[q]];
+            if (p.fb == e.fb && p.prog == e.prog && p.count == e.count && p.key != e.key && memcmp(p.sc, e.sc, sizeof(p.sc)) != 0) {
+                alias[e.key] = p.key;
+                cursor = q + 1;
+                break;
+            }
+        }
+    }
+    // the picture is the target drawn last (trailing copies to the window carry no layers)
+    GLuint root = ev.back().fb;
+    for (size_t i = ev.size(); i-- > 0;)
+        if (ev[i].prog) {
+            root = ev[i].fb;
+            break;
+        }
+    std::vector<uint64_t> order;
+    WalkLayout(ev, alias, root, ev.size(), 0, order);
+    const size_t n = order.size();
+    for (size_t k = 0; k < n; ++k) c->layoutPos[order[k]] = k;
+    c->layoutCount = n;
+    for (auto& a : alias) {
+        auto it = c->layoutPos.find(a.second);
+        if (it != c->layoutPos.end()) c->layoutPos.emplace(a.first, it->second);
+    }
+    if (g_traceNow) {
+        std::string s, comp;
+        for (const FlatEv& e : ev) {   // composites and copies, to see where the walk stops
+            if (e.key) continue;
+            char buf[48];
+            sprintf_s(buf, " fb%u<", e.fb);
+            comp += buf;
+            for (int k = 0; k < e.nsrc; ++k) {
+                sprintf_s(buf, "%sfb%u", k ? "," : "", e.src[k]);
+                comp += buf;
+            }
+        }
+        Log("T %u layout events %zu, root fb%u, composites/copies:%s", g_frame, ev.size(), root, comp.c_str());
+        for (size_t k = 0; k < n; ++k) {
+            for (const FlatEv& e : ev)
+                if (e.key == order[k]) {
+                    char buf[64];
+                    sprintf_s(buf, " %zu:fb%u/p%u/t%u", k, e.fb, e.prog, e.tex);
+                    s += buf;
+                    break;
+                }
+        }
+        Log("T %u layout (far to near, %zu groups, %zu repeats):%s", g_frame, n, alias.size(), s.c_str());
+    }
+    ev.clear();
+}
+
+// A bound texture has a right-eye clone: it is a stereo render target, so this draw composites or
+// post-processes images that already have their per-eye offsets.
+bool SamplesStereoTarget(Ctx* c)
+{
+    const uint32_t units = SampledUnits(c);
+    for (int u = 0; u <= c->maxUnit; ++u)
+        for (int sl = 0; sl < kSlotCount && UnitIn(units, u); ++sl) {
+            GLuint id = c->bound[u][sl];
+            if (!id) continue;
+            TexInfo* ti = FindTex(id);
+            if (ti && ti->right) return true;
+            if (ti && ti->viewOf) {
+                TexInfo* oi = FindTex(ti->viewOf);
+                if (oi && oi->right) return true;
+            }
+        }
+    return false;
+}
+
 void EyeBegin(Ctx* c, float eye, EyeState& st)
 {
     st.matrix = false;
@@ -523,6 +901,45 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
             pi->eye = eye;
             pi->ver = g_paramVer;
             g_stats.uniformSets++;
+        }
+        if (pi->gs) {
+            if (pi->fVer != g_paramVer) {
+                R.Uniform4f(pi->locF, g_cfg.flatEnable ? (g_cfg.flatRule == 1 ? 2.0f : 1.0f) : 0.0f, g_cfg.flatTop,
+                            g_cfg.flatPlane, g_cfg.flatZero);
+                pi->fVer = g_paramVer;
+                pi->lastD[0] = NAN;
+            }
+            // screen depth: later batches (UI), and passes that read a stereo render target (the
+            // scene already drawn per eye being composited or post-processed)
+            float d = (g_cfg.flatScreenBatch > 0 && c->batch >= g_cfg.flatScreenBatch) || SamplesStereoTarget(c) ? 1.0f : 0.0f;
+            const bool order = g_cfg.flatRule == 1;
+            float w = order ? c->orderDepth * g_cfg.flatTop - g_cfg.flatZero : 0.0f;
+            // order rule: a draw spreads over 80% of its group's slot, so groups never overlap
+            float slot = order ? c->orderSlot * g_cfg.flatTop * 0.8f : 0.0f;
+            if (d == 0.0f && order && c->drawFb) {
+                auto f = c->fbo.find(c->drawFb);
+                if (f != c->fbo.end() && f->second.promoted) {
+                    // layer cache: its offset is scaled to the part of it that fills the screen (the
+                    // scissored region), so a layer moves as far on screen as one drawn there directly
+                    float scale = g_cfg.flatCacheScale;
+                    if (scale <= 0.0f) {
+                        scale = 1.0f;
+                        GLint vp[4] = {}, sc[4] = {};
+                        R.GetIntegerv(GL_VIEWPORT, vp);
+                        if (R.IsEnabled(GL_SCISSOR_TEST)) {
+                            R.GetIntegerv(GL_SCISSOR_BOX, sc);
+                            if (sc[2] > 0 && sc[2] < vp[2]) scale = (float)sc[2] / (float)vp[2];
+                        }
+                    }
+                    w *= scale;
+                    slot *= scale;
+                }
+            }
+            const float v[4] = {d, order ? slot : g_cfg.flatSpriteMin, order ? c->drawPrims : g_cfg.flatPlaneHeight, w};
+            if (memcmp(v, pi->lastD, sizeof(v)) != 0) {
+                R.Uniform4f(pi->locD, v[0], v[1], v[2], v[3]);
+                memcpy(pi->lastD, v, sizeof(v));
+            }
         }
         return;
     }
@@ -564,6 +981,13 @@ void SwapTextures(Ctx* c, bool toRight)
             GLuint id = c->bound[u][s];
             if (!id) continue;
             TexInfo* ti = FindTex(id);
+            if (ti && !ti->right && ti->viewOf && toRight) {
+                TexInfo* oi = FindTex(ti->viewOf);
+                if (oi && oi->right) {
+                    TexClone(c, id, ti->target);
+                    ti = FindTex(id);
+                }
+            }
             if (!ti || !ti->right) continue;
             if (glUnit != (GLuint)u) {
                 R.ActiveTexture(GL_TEXTURE0 + u);
@@ -574,6 +998,8 @@ void SwapTextures(Ctx* c, bool toRight)
     }
     if (glUnit != c->activeUnit) R.ActiveTexture(GL_TEXTURE0 + c->activeUnit);
 }
+
+void TraceStep(Ctx* c);
 
 template <class F>
 void StereoDraw(F&& draw)
@@ -593,12 +1019,28 @@ void StereoDraw(F&& draw)
         if (c->program && c->program == g_huntSel) return;   // hidden while selected
     }
     if (mode == kModeSkip) return;
+    if (c->isMain) {
+        if (c->batchPending) {
+            if (c->drawFb == c->batchFb) c->batch++;
+            c->batchPending = false;
+        }
+        c->batchFb = c->drawFb;
+        c->drawsInBatch++;
+    }
+    if (pi && pi->gs && g_cfg.flatRule == 1 && c->isMain) OrderDepthForDraw(c);
+    if (pi && pi->gs && t_drawMode != GL_TRIANGLES && t_drawMode != GL_TRIANGLE_STRIP && t_drawMode != GL_TRIANGLE_FAN) {
+        // a geometry shader only takes triangles; points/lines would fail (TODO: GS-less twin program)
+        static int logged;
+        if (logged++ < 5) Log("flat depth: program %u drew primitive mode 0x%x, skipped (geometry shader takes triangles)", c->program, t_drawMode);
+        return;
+    }
     GLuint right = Active(c) ? RightFor(c, c->drawFb) : 0;
     EyeState st;
     if (!right) {
         EyeBegin(c, 0.0f, st);
         draw();
         g_stats.monoDraws++;
+        TraceStep(c);
         return;
     }
     const float eye = mode == kModeMono ? 0.0f : 1.0f;   // mono: both eyes, no offset (screen depth)
@@ -613,6 +1055,7 @@ void StereoDraw(F&& draw)
     SwapTextures(c, false);
     R.BindFramebuffer(GL_DRAW_FRAMEBUFFER, RealFb(c, c->drawFb));
     g_stats.stereoDraws++;
+    TraceStep(c);
 }
 
 // Clears and other target-only operations: both eyes, no eye offset.
@@ -655,6 +1098,95 @@ void StereoCopy(GLenum target, F&& copy)
     R.BindTexture(target, dst);
     R.BindFramebuffer(GL_READ_FRAMEBUFFER, RealFb(c, c->readFb));
     g_stats.copies++;
+}
+
+// ---------------------------------------------------------------------------------------------
+// draw trace ([Debug] trace_frames): one log line per draw call in the listed frames
+
+bool g_traceNow;              // the current frame is listed in trace_frames
+unsigned g_traceDraw;         // draw index within the traced frame
+
+bool ListedIn(const std::string& s, unsigned frame)
+{
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t j = s.find(',', i);
+        if (j == std::string::npos) j = s.size();
+        if ((unsigned)strtoul(s.c_str() + i, nullptr, 10) == frame && j > i) return true;
+        i = j + 1;
+    }
+    return false;
+}
+
+// first mat4 uniform of a program (usually its transform), for the trace
+std::unordered_map<GLuint, std::pair<GLint, std::string>> g_traceMat;
+
+void TraceDraw(const char* fn, GLenum mode, GLsizei count)
+{
+    t_drawMode = mode;
+    t_drawCount = count;
+    Ctx* c = t_ctx;
+    if (!g_traceNow || !c || !c->isMain || c->listMode) return;
+    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    ProgInfo* pi = c->program ? FindProg(c->program) : nullptr;
+    GLint vp[4] = {}, sc[4] = {};
+    R.GetIntegerv(GL_VIEWPORT, vp);
+    bool scissor = R.IsEnabled(GL_SCISSOR_TEST) != 0;
+    if (scissor) R.GetIntegerv(GL_SCISSOR_BOX, sc);
+    bool blend = R.IsEnabled(GL_BLEND) != 0;
+    GLuint tex = c->bound[0][kSlot2D];
+    TexInfo* ti = tex ? FindTex(tex) : nullptr;
+    char mat[160] = "";
+    if (c->program && R.GetActiveUniform && R.GetUniformfv) {
+        auto it = g_traceMat.find(c->program);
+        if (it == g_traceMat.end()) {
+            std::pair<GLint, std::string> m{-1, ""};
+            GLint n = 0;
+            R.GetProgramiv(c->program, GL_ACTIVE_UNIFORMS, &n);
+            for (GLint i = 0; i < n && m.first < 0; ++i) {
+                char name[128];
+                GLsizei len = 0;
+                GLint size = 0;
+                GLenum type = 0;
+                R.GetActiveUniform(c->program, (GLuint)i, sizeof(name), &len, &size, &type, name);
+                if (type == GL_FLOAT_MAT4 && strncmp(name, "gl_", 3) != 0) m = {R.GetUniformLocation(c->program, name), name};
+            }
+            it = g_traceMat.emplace(c->program, m).first;
+        }
+        if (it->second.first >= 0) {
+            GLfloat m[16];
+            R.GetUniformfv(c->program, it->second.first, m);
+            snprintf(mat, sizeof(mat), " %s=[%.4f %.4f %.4f %.4f | %.4f %.4f %.4f]", it->second.second.c_str(), m[0], m[5],
+                     m[1], m[4], m[12], m[13], m[14]);
+        }
+    }
+    FboInfo* fi = nullptr;
+    if (c->drawFb) {
+        auto f = c->fbo.find(c->drawFb);
+        if (f != c->fbo.end()) fi = &f->second;
+    }
+    std::string sampled;   // units the program reads: texture (size), v = view of, R = has a right-eye clone
+    const uint32_t units = SampledUnits(c);
+    for (int u = 0; u <= c->maxUnit && u < 32; ++u) {
+        if (!((units >> u) & 1)) continue;
+        for (int sl = 0; sl < kSlotCount; ++sl) {
+            const GLuint id = c->bound[u][sl];
+            if (!id) continue;
+            TexInfo* t2 = FindTex(id);
+            TexInfo* o2 = t2 && t2->viewOf ? FindTex(t2->viewOf) : nullptr;
+            char buf[80];
+            sprintf_s(buf, " u%d/s%d:%u(%dx%d)%s%s", u, sl, id, t2 ? t2->w : -1, t2 ? t2->h : -1,
+                      t2 && t2->viewOf ? (std::string("v") + std::to_string(t2->viewOf)).c_str() : "",
+                      (t2 && t2->right) || (o2 && o2->right) ? "R" : "");
+            sampled += buf;
+        }
+    }
+    Log("T %u.%u b%d %s mode=%x n=%d prog=%u/%08x%s%s fb=%u%s(t%u) vp=%d,%d,%d,%d%s sc=%d,%d,%d,%d blend=%d tex=%u(%dx%d)%s", g_frame,
+        g_traceDraw++, c->batch, fn, mode, count, c->program, pi ? pi->hash : 0, pi && pi->loc < 0 ? "(noinj)" : "",
+        pi && pi->gs ? "(gs)" : "", c->drawFb,
+        c->drawFb == 0 || (fi && fi->stereo) ? "S" : "", fi ? fi->att[0].id : 0, vp[0], vp[1], vp[2], vp[3], scissor ? "" : "(off)", sc[0], sc[1],
+        sc[2], sc[3], blend, tex, ti ? ti->w : 0, ti ? ti->h : 0, mat);
+    if (!sampled.empty() || units != ~0u) Log("T %u.%u   samples%s%s", g_frame, g_traceDraw - 1, sampled.c_str(), units == ~0u ? " (all units)" : "");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -802,10 +1334,18 @@ struct GlStateGuard {
     GLint viewport[4] = {}, vao = 0, arrayBuf = 0, elemBuf = 0, unpackBuf = 0, packBuf = 0, samplers[4] = {};
     GLint blend[4] = {}, blendEq[2] = {GL_FUNC_ADD, GL_FUNC_ADD}, polygonMode[2] = {GL_FILL, GL_FILL};
     GLboolean enables[12] = {}, colorMask[4] = {1, 1, 1, 1}, depthMask = 1;
+    GLint clipOrigin = GL_LOWER_LEFT, clipDepth = GL_NEGATIVE_ONE_TO_ONE;
 
     explicit GlStateGuard(Ctx* ctx) : c(ctx)
     {
         R.BindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (R.ClipControl) {
+            // WineD3D keeps the D3D convention (origin upper left): our full-screen passes (SR weaver,
+            // overlay) are written for GL's and came out upside down
+            R.GetIntegerv(GL_CLIP_ORIGIN, &clipOrigin);
+            R.GetIntegerv(GL_CLIP_DEPTH_MODE, &clipDepth);
+            if (clipOrigin != GL_LOWER_LEFT || clipDepth != GL_NEGATIVE_ONE_TO_ONE) R.ClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
+        }
         for (int i = 0; i < 12; ++i) enables[i] = R.IsEnabled(kEnables[i]);   // (rasterizer discard is in no attrib group)
         if (c->compat) {
             R.PushAttrib(GL_ALL_ATTRIB_BITS);
@@ -872,6 +1412,8 @@ struct GlStateGuard {
         R.ActiveTexture(GL_TEXTURE0 + c->activeUnit);
         R.BindRenderbuffer(GL_RENDERBUFFER, c->rbBinding);
         R.Viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+        if (R.ClipControl && (clipOrigin != GL_LOWER_LEFT || clipDepth != GL_NEGATIVE_ONE_TO_ONE))
+            R.ClipControl(clipOrigin, clipDepth);
     }
 };
 
@@ -1635,7 +2177,7 @@ bool Compose(Ctx* c, HDC dc)
         overlay(c->sbsFbo, {{0, 0, W, H}, {W, 0, W, H}});
         presented = PresentFrame(WindowFromDC(dc), c->sbsFbo, W, H, g_cfg.output == 4 && !g_weaveOff);
         if (!presented && g_cfg.output == 4) SrSetLens(false);
-    } else if (g_cfg.output == 4 && !g_weaveOff && SrAvailable(WindowFromDC(dc))) {
+    } else if (g_cfg.output == 4 && !g_weaveOff && SrAvailableOwn(WindowFromDC(dc))) {
         EnsureSbs(c);
         R.BindFramebuffer(GL_DRAW_FRAMEBUFFER, c->sbsFbo);
         blit(left, 0, 0, W, H);
@@ -1678,7 +2220,7 @@ bool Compose(Ctx* c, HDC dc)
             break;
         }
     }
-    if (stereo) AutoConvergenceStep(c);
+    if (stereo && !g_cfg.flatEnable) AutoConvergenceStep(c);   // flat depth has no view depth to converge on
     ProbeStep(c);
     if (g_cfg.virtualBackbuffer) EnsureVbb(c);   // the game's next frame goes there
     if (c->vbbLive) {
@@ -1858,6 +2400,50 @@ void DumpFrame(Ctx* c)
     MeasureDisparity(L, Rt, W, H);
 }
 
+// [Debug] trace_steps: in a traced frame, saves the left-eye target of every draw after it ran
+// (OGL3D_step<frame>_<draw>.bmp, at most 640 wide), so off-screen caches and layers can be seen.
+void TraceStep(Ctx* c)
+{
+    if (!g_traceNow || !g_cfg.traceSteps || !c->isMain || g_traceDraw == 0) return;
+    int W = c->winW, H = c->winH;
+    if (c->drawFb) {
+        auto f = c->fbo.find(c->drawFb);
+        if (f == c->fbo.end() || f->second.w <= 0 || f->second.h <= 0) return;
+        W = f->second.w;
+        H = f->second.h;
+    }
+    if (W <= 0 || H <= 0) return;
+    std::vector<uint8_t> px((size_t)W * H * 4);
+    GLint pack = 0, align = 4, rowLen = 0;
+    R.GetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
+    if (pack) R.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    R.GetIntegerv(GL_PACK_ALIGNMENT, &align);
+    R.GetIntegerv(GL_PACK_ROW_LENGTH, &rowLen);
+    R.PixelStorei(GL_PACK_ALIGNMENT, 4);
+    R.PixelStorei(GL_PACK_ROW_LENGTH, 0);
+    R.BindFramebuffer(GL_READ_FRAMEBUFFER, RealFb(c, c->drawFb));
+    GLint readBuf = 0;   // WineD3D leaves GL_NONE on its draw framebuffers
+    R.GetIntegerv(GL_READ_BUFFER, &readBuf);
+    if (RealFb(c, c->drawFb)) R.ReadBuffer(GL_COLOR_ATTACHMENT0);
+    R.ReadPixels(0, 0, W, H, GL_BGRA, GL_UNSIGNED_BYTE, px.data());
+    R.ReadBuffer((GLenum)readBuf);
+    R.BindFramebuffer(GL_READ_FRAMEBUFFER, RealFb(c, c->readFb));
+    R.PixelStorei(GL_PACK_ALIGNMENT, align);
+    R.PixelStorei(GL_PACK_ROW_LENGTH, rowLen);
+    if (pack) R.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
+    const int s = (W + 639) / 640, ow = W / s, oh = H / s;
+    std::vector<uint8_t> small((size_t)ow * oh * 4);
+    for (int y = 0; y < oh; ++y)
+        for (int x = 0; x < ow; ++x) {
+            uint8_t* o = &small[((size_t)y * ow + x) * 4];
+            memcpy(o, &px[((size_t)(y * s) * W + (size_t)x * s) * 4], 4);
+            o[3] = 255;
+        }
+    wchar_t name[64];
+    swprintf_s(name, L"OGL3D_step%05u_%03u.bmp", g_frame, g_traceDraw - 1);
+    WriteBmp(ModuleDir() + name, ow, oh, small);
+}
+
 bool KeyDown(const Hotkey& k)
 {
     if (!k.vk || !(GetAsyncKeyState(k.vk) & 0x8000)) return false;
@@ -1895,8 +2481,9 @@ std::wstring KeyName(const Hotkey& k)
 std::wstring ValuesText()
 {
     wchar_t buf[128];
-    swprintf_s(buf, L"Separation %.1f%%    Convergence %.2f%ls", g_cfg.separation, g_cfg.convergence,
-               g_cfg.autoConvergence ? L" (auto)" : L"");
+    if (g_cfg.flatEnable) swprintf_s(buf, L"Separation %.1f%%    Screen depth %.2f", g_cfg.separation, g_cfg.flatZero);
+    else swprintf_s(buf, L"Separation %.1f%%    Convergence %.2f%ls", g_cfg.separation, g_cfg.convergence,
+                    g_cfg.autoConvergence ? L" (auto)" : L"");
     return buf;
 }
 
@@ -1986,6 +2573,71 @@ void HuntCycleMode()
     UpdateStatus();
 }
 
+// [Keys] swallow: the game does not see our hotkeys. Games often react to a key whatever the
+// modifiers (Door Kickers: Action Squad toggles its frame statistics on F5, so Ctrl+F5 flipped them),
+// so the keyboard messages of a hotkey become WM_NULL on the window's thread before the game gets
+// them. PollHotkeys reads GetAsyncKeyState and still sees the keys.
+HHOOK g_keyHook;
+HWND g_keyHookWnd;
+bool g_keySwallowed[256];   // key-down eaten: eat its key-up too
+
+bool IsOurHotkey(int vk, bool ctrl, bool shift, bool alt)
+{
+    const Hotkey* keys[] = {&g_cfg.keySepDown, &g_cfg.keySepUp, &g_cfg.keyConvDown, &g_cfg.keyConvUp, &g_cfg.keySave,
+                            &g_cfg.keyToggle, &g_cfg.keyDump, &g_cfg.keyWeave, &g_cfg.keyShowValues, &g_cfg.keyAutoConv,
+                            &g_cfg.keyHunt, &g_cfg.keyHuntPrev, &g_cfg.keyHuntNext, &g_cfg.keyHuntMode};
+    for (const Hotkey* k : keys) {
+        const bool huntNav = k == &g_cfg.keyHuntPrev || k == &g_cfg.keyHuntNext || k == &g_cfg.keyHuntMode;
+        if (k->vk == vk && k->ctrl == ctrl && k->shift == shift && k->alt == alt && (!huntNav || g_hunting)) return true;
+    }
+    return false;
+}
+
+LRESULT CALLBACK KeyMsgHook(int code, WPARAM remove, LPARAM lp)
+{
+    MSG* m = (MSG*)lp;
+    if (code == HC_ACTION && g_cfg.swallowKeys && m) {
+        int vk = 0;
+        bool down = false;
+        if (m->message == WM_KEYDOWN || m->message == WM_SYSKEYDOWN) {
+            vk = (int)m->wParam;
+            down = true;
+        } else if (m->message == WM_KEYUP || m->message == WM_SYSKEYUP) {
+            vk = (int)m->wParam;
+        } else if (m->message == WM_INPUT) {
+            RAWINPUT ri;
+            UINT size = sizeof(ri);
+            if (GetRawInputData((HRAWINPUT)m->lParam, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+                ri.header.dwType == RIM_TYPEKEYBOARD) {
+                vk = ri.data.keyboard.VKey;
+                down = !(ri.data.keyboard.Flags & RI_KEY_BREAK);
+            }
+        }
+        if (vk > 0 && vk < 256) {
+            const bool eat = down ? IsOurHotkey(vk, (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0,
+                                                (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0,
+                                                (GetAsyncKeyState(VK_MENU) & 0x8000) != 0)
+                                  : g_keySwallowed[vk];
+            if (eat) {
+                if (remove == PM_REMOVE) g_keySwallowed[vk] = down;
+                m->message = WM_NULL;
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, remove, lp);
+}
+
+// Hooks the message retrieval of the thread that owns the game window (once per window).
+void KeyHookFor(HWND wnd)
+{
+    if (!g_cfg.swallowKeys || !wnd || wnd == g_keyHookWnd) return;
+    const DWORD tid = GetWindowThreadProcessId(wnd, nullptr);
+    if (g_keyHook) UnhookWindowsHookEx(g_keyHook);
+    g_keyHook = SetWindowsHookExW(WH_GETMESSAGE, KeyMsgHook, nullptr, tid);
+    g_keyHookWnd = wnd;
+    Log("hotkeys: kept from the game (message hook on window thread %lu)%s", tid, g_keyHook ? "" : " - hook failed");
+}
+
 void PollHotkeys(float dt)
 {
     DWORD pid = 0;
@@ -1997,12 +2649,17 @@ void PollHotkeys(float dt)
     if (KeyDown(g_cfg.keySepUp)) g_cfg.separation = std::min(200.0f, g_cfg.separation + 25.0f * dt), changed = true;
     if (KeyDown(g_cfg.keySepDown)) g_cfg.separation = std::max(0.0f, g_cfg.separation - 25.0f * dt), changed = true;
     const bool convUp = KeyDown(g_cfg.keyConvUp), convDown = KeyDown(g_cfg.keyConvDown);
-    if ((convUp || convDown) && g_cfg.autoConvergence) {
+    if (g_cfg.flatEnable && (convUp || convDown)) {
+        // flat depth: the convergence keys move the depth that sits on the screen plane
+        g_cfg.flatZero += (convUp ? 0.3f : -0.3f) * dt;
+        g_cfg.flatZero = std::max(-1.0f, std::min(2.0f, g_cfg.flatZero));
+        changed = true;
+    } else if ((convUp || convDown) && g_cfg.autoConvergence) {
         g_cfg.autoConvergence = false;   // adjusting by hand takes over from auto
         Log("auto convergence off (manual adjustment)");
     }
-    if (convUp) g_cfg.convergence *= std::exp(0.7f * dt), changed = true;
-    if (convDown) g_cfg.convergence *= std::exp(-0.7f * dt), changed = true;
+    if (convUp && !g_cfg.flatEnable) g_cfg.convergence *= std::exp(0.7f * dt), changed = true;
+    if (convDown && !g_cfg.flatEnable) g_cfg.convergence *= std::exp(-0.7f * dt), changed = true;
     if (Pressed(g_cfg.keyAutoConv, pAuto)) {
         g_cfg.autoConvergence = !g_cfg.autoConvergence;
         Log("auto convergence %s", g_cfg.autoConvergence ? "on" : "off");
@@ -2018,13 +2675,14 @@ void PollHotkeys(float dt)
         if (g_cfg.showValues) UpdateStatus();
     } else if (adjusting) {
         adjusting = false;
-        Log("separation %.2f%% convergence %.4f", g_cfg.separation, g_cfg.convergence);
+        Log("separation %.2f%% convergence %.4f flat screen depth %.3f", g_cfg.separation, g_cfg.convergence, g_cfg.flatZero);
     }
     if (Pressed(g_cfg.keySave, pSave)) {
         SaveStereoValues();
         // always English (user preference), whatever the Windows UI language
         wchar_t buf[200];
-        if (g_cfg.autoConvergence) swprintf_s(buf, L"Saved    Separation %.1f%%    Convergence auto", g_cfg.separation);
+        if (g_cfg.flatEnable) swprintf_s(buf, L"Saved    Separation %.1f%%    Screen depth %.2f", g_cfg.separation, g_cfg.flatZero);
+        else if (g_cfg.autoConvergence) swprintf_s(buf, L"Saved    Separation %.1f%%    Convergence auto", g_cfg.separation);
         else swprintf_s(buf, L"Saved    Separation %.1f%%    Convergence %.2f", g_cfg.separation, g_cfg.convergence);
         std::wstring msg = buf;
         if (!g_cfg.overrides.empty()) {
@@ -2072,15 +2730,7 @@ void PollHotkeys(float dt)
 
 bool FrameListed(unsigned frame)
 {
-    const std::string& s = g_cfg.dumpFrames;
-    size_t i = 0;
-    while (i < s.size()) {
-        size_t j = s.find(',', i);
-        if (j == std::string::npos) j = s.size();
-        if ((unsigned)strtoul(s.c_str() + i, nullptr, 10) == frame && j > i) return true;
-        i = j + 1;
-    }
-    return false;
+    return ListedIn(g_cfg.dumpFrames, frame);
 }
 
 // The client size in the window's own DPI awareness = the size of its GL default framebuffer
@@ -2279,6 +2929,13 @@ void GLAPIENTRY H_BlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GL
     if (c && c->drawFb == 0) c->fb0Touched = true;
     if (!Active(c)) return;
     std::lock_guard<std::recursive_mutex> lk(g_lock);
+    if (g_cfg.flatEnable && g_cfg.flatRule == 1 && c->isMain && (mask & GL_COLOR_BUFFER_BIT) && c->readFb != c->drawFb) {
+        FlatEv ev;   // a copy of another target's picture, for the composition order (ComputeLayout)
+        ev.fb = c->drawFb;
+        ev.src[0] = c->readFb;
+        ev.nsrc = 1;
+        c->flatEvents.push_back(ev);
+    }
     GLuint rightDraw = RightFor(c, c->drawFb);
     if (!rightDraw) return;
     GLuint rightRead = RightFor(c, c->readFb);
@@ -2331,6 +2988,76 @@ void GLAPIENTRY H_GenerateMipmap(GLenum target)
         while ((std::max(ti->w, ti->h) >> levels) > 0) ++levels;
         ti->levels = std::max(ti->levels, levels);
     }
+}
+
+void GLAPIENTRY H_TextureView(GLuint tex, GLenum target, GLuint orig, GLenum ifmt, GLuint minLevel, GLuint numLevels,
+                              GLuint minLayer, GLuint numLayers)
+{
+    R.TextureView(tex, target, orig, ifmt, minLevel, numLevels, minLayer, numLayers);
+    CTX_OR_RETURN((void)0);
+    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    TexInfo* oi = FindTex(orig);
+    if (!oi) {
+        TexInfo q;
+        if (!QueryTex(c, orig, target, q)) return;
+        oi = &(g_tex[orig] = q);
+    }
+    TexInfo v;
+    v.target = target;
+    v.w = std::max(1, oi->w >> minLevel);
+    v.h = std::max(1, oi->h >> minLevel);
+    v.ifmt = ifmt;
+    v.samples = oi->samples;
+    v.levels = (int)numLevels;
+    v.immutable = true;
+    v.viewOf = orig;
+    v.viewFmt = ifmt;
+    v.minLevel = minLevel;
+    v.numLevels = numLevels;
+    v.minLayer = minLayer;
+    v.numLayers = numLayers;
+    TexInfo& slot = g_tex[tex];
+    DeleteTexClone(slot);
+    slot = v;
+}
+
+// glCopyImageSubData (D3D11 CopyResource/CopySubresourceRegion in WineD3D): the right-eye clones
+// get the same copy, from the source's clone when it has one.
+GLuint RightName(Ctx* c, GLuint name, GLenum target)
+{
+    if (target == GL_RENDERBUFFER) {
+        auto it = g_rb.find(name);
+        return it != g_rb.end() ? it->second.right : 0;
+    }
+    TexInfo* ti = FindTex(name);
+    if (!ti) return 0;
+    if (!ti->right && ti->viewOf) {
+        TexInfo* oi = FindTex(ti->viewOf);
+        if (oi && oi->right) return TexClone(c, name, ti->target);
+    }
+    return ti->right;
+}
+
+void GLAPIENTRY H_CopyImageSubData(GLuint src, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ,
+                                   GLuint dst, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ,
+                                   GLsizei w, GLsizei h, GLsizei d)
+{
+    R.CopyImageSubData(src, srcTarget, srcLevel, srcX, srcY, srcZ, dst, dstTarget, dstLevel, dstX, dstY, dstZ, w, h, d);
+    Ctx* c = t_ctx;
+    if (!c || !Active(c)) return;
+    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    if (srcTarget != GL_RENDERBUFFER && dstTarget != GL_RENDERBUFFER && src != dst) c->texCopiedFrom[dst] = src;
+    GLuint srcR = RightName(c, src, srcTarget);
+    GLuint dstR = RightName(c, dst, dstTarget);
+    if (!dstR && srcR) {
+        // a stereo image copied into a plain texture: that texture becomes stereo too
+        TexInfo* di = dstTarget == GL_RENDERBUFFER ? nullptr : FindTex(dst);
+        if (di || (dstTarget != GL_RENDERBUFFER && SlotOf(dstTarget) >= 0)) dstR = TexClone(c, dst, dstTarget);
+    }
+    if (!dstR) return;
+    R.CopyImageSubData(srcR ? srcR : src, srcTarget, srcLevel, srcX, srcY, srcZ, dstR, dstTarget, dstLevel, dstX, dstY,
+                       dstZ, w, h, d);
+    g_stats.copies++;
 }
 
 void GLAPIENTRY H_TexStorage2D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h)
@@ -2391,10 +3118,14 @@ void DumpProgram(GLuint prog, uint32_t hash, const GLuint* shaders, GLsizei n)
     for (GLsizei i = 0; i < n; ++i) {
         GLint type = 0;
         R.GetShaderiv(shaders[i], GL_SHADER_TYPE, &type);
-        const char* kind = (GLenum)type == GL_VERTEX_SHADER ? "vertex" : (GLenum)type == GL_FRAGMENT_SHADER ? "fragment" : "other";
+        const char* kind = (GLenum)type == GL_VERTEX_SHADER ? "vertex" : (GLenum)type == GL_FRAGMENT_SHADER ? "fragment"
+                         : (GLenum)type == GL_GEOMETRY_SHADER ? "geometry" : "other";
         auto it = g_shaderSrc.find(shaders[i]);
         fprintf(f, "\n// ======== %s shader %u ========\n", kind, shaders[i]);
-        if (it != g_shaderSrc.end()) fwrite(it->second.data(), 1, it->second.size(), f);
+        const std::string* src = it != g_shaderSrc.end() ? &it->second : nullptr;
+        for (auto& kv : g_flatGs)
+            if (!src && kv.second == shaders[i] && t_ctx && kv.first.first == t_ctx->rc) src = &kv.first.second;   // our flat depth geometry shader
+        if (src) fwrite(src->data(), 1, src->size(), f);
         else fprintf(f, "// (source not seen)\n");
     }
     fclose(f);
@@ -2402,7 +3133,7 @@ void DumpProgram(GLuint prog, uint32_t hash, const GLuint* shaders, GLsizei n)
 
 void GLAPIENTRY H_ShaderSource(GLuint sh, GLsizei count, const GLchar* const* str, const GLint* len)
 {
-    if (!t_ctx || count <= 0 || !str) {
+    if (!t_ctx || t_ownShaders || count <= 0 || !str) {
         R.ShaderSource(sh, count, str, len);
         return;
     }
@@ -2424,19 +3155,71 @@ void GLAPIENTRY H_ShaderSource(GLuint sh, GLsizei count, const GLchar* const* st
         return;
     }
     std::string out;
-    if (!InjectVertexShader(src, out)) {
-        g_injectFailCount++;
-        Log("vertex shader %u: no main() found, left as is", sh);
+    const bool hasMain = InjectVertexShader(src, out);
+    if (!hasMain) {
+        // A vertex shader piece without main(), linked together with the one that has it (WineD3D
+        // writes its VS -> PS linkage in such a piece). Flat depth must see its outputs as well.
+        out = src;
+        if (src.find("s3d_main0") == std::string::npos && !g_cfg.flatEnable) {
+            g_injectFailCount++;
+            Log("vertex shader %u: no main() found, left as is", sh);
+        }
+    }
+    VsInfo vi;
+    std::string why;
+    DWORD t0 = GetTickCount();
+    bool renamed = g_cfg.flatEnable && AnalyzeVertexShader(out, vi, why);
+    if (GetTickCount() - t0 > 50) Log("flat depth: analysing vertex shader %u (%zu bytes) took %lu ms", sh, out.size(), GetTickCount() - t0);
+    if (g_cfg.flatEnable && !renamed) Log("flat depth: vertex shader %u left without geometry shader (%s)", sh, why.c_str());
+    if (!hasMain && !renamed) {
         R.ShaderSource(sh, count, str, len);
+        std::lock_guard<std::recursive_mutex> lk(g_lock);
+        g_vsInfo.erase(sh);
+        g_vsPlain.erase(sh);
+        if (g_cfg.flatEnable) g_vsBad.insert(sh);
         return;
     }
-    const GLchar* p = out.c_str();
+    const GLchar* p = renamed ? vi.renamed.c_str() : out.c_str();
     R.ShaderSource(sh, 1, &p, nullptr);
     {
         std::lock_guard<std::recursive_mutex> lk(g_lock);
         g_injectedSrc[sh] = src;
+        g_vsInfo.erase(sh);
+        g_vsPlain.erase(sh);
+        g_vsBad.erase(sh);
+        if (renamed) {
+            g_vsInfo[sh] = std::move(vi);
+            g_vsPlain[sh] = out;
+        } else if (g_cfg.flatEnable) {
+            g_vsBad.insert(sh);
+        }
+    }
+    if (!hasMain) {
+        static int logged;
+        if (logged++ < 3) Log("vertex shader %u has no main() (a piece of a larger one): outputs renamed for flat depth", sh);
+        return;
     }
     if (++g_injectedCount <= 3) Log("vertex shader %u rewritten for stereo (%zu -> %zu bytes)", sh, src.size(), out.size());
+}
+
+// Puts the stereo rewrite without renamed outputs back (no flat depth geometry shader for it).
+bool UnrenameVertexShader(GLuint sh)
+{
+    std::string plain;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_lock);
+        auto it = g_vsPlain.find(sh);
+        if (it == g_vsPlain.end()) return false;
+        plain = std::move(it->second);
+        g_vsPlain.erase(it);
+        g_vsInfo.erase(sh);
+    }
+    const GLchar* p = plain.c_str();
+    R.ShaderSource(sh, 1, &p, nullptr);
+    R.CompileShader(sh);
+    GLint ok = 0;
+    R.GetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    return ok != 0;
 }
 
 void GLAPIENTRY H_CompileShader(GLuint sh)
@@ -2453,6 +3236,12 @@ void GLAPIENTRY H_CompileShader(GLuint sh)
     GLint ok = 0;
     R.GetShaderiv(sh, GL_COMPILE_STATUS, &ok);
     if (ok) return;
+    if (g_vsPlain.count(sh)) {
+        char log[2048] = {};
+        R.GetShaderInfoLog(sh, sizeof(log) - 1, nullptr, log);
+        Log("flat depth: renamed vertex shader %u failed to compile, using the plain stereo rewrite:\n%s", sh, log);
+        if (UnrenameVertexShader(sh)) return;
+    }
     // The rewrite broke this shader: log why and fall back to the original source.
     char log[2048] = {};
     R.GetShaderInfoLog(sh, sizeof(log) - 1, nullptr, log);
@@ -2463,11 +3252,113 @@ void GLAPIENTRY H_CompileShader(GLuint sh)
     R.CompileShader(sh);
 }
 
+// Flat depth: compiles (once per distinct source) and attaches the geometry shader for the program's
+// renamed vertex shader. Returns the vertex shader it was made for, or 0.
+GLuint AttachFlatGs(GLuint prog, GLuint& gsOut)
+{
+    // GL calls stay outside g_lock: WineD3D drives GL from several threads, and a driver call made
+    // while holding the lock can wait on a thread that is itself waiting for the lock.
+    gsOut = 0;
+    if (!g_cfg.flatEnable || !t_ctx || t_ownShaders || !R.GetAttachedShaders || !R.DetachShader) return 0;
+    GLuint shaders[8];
+    GLsizei n = 0;
+    R.GetAttachedShaders(prog, 8, &n, shaders);
+    GLint types[8] = {};
+    for (GLsizei i = 0; i < n; ++i) R.GetShaderiv(shaders[i], GL_SHADER_TYPE, &types[i]);
+    // Every vertex shader piece of the program counts: WineD3D links a main() piece with a piece that
+    // writes the outputs. The geometry shader passes the outputs of all of them.
+    GLuint vs = 0;
+    VsInfo info;
+    bool incomplete = false;
+    std::vector<GLuint> detach, renamed;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_lock);
+        for (GLsizei i = 0; i < n; ++i) {
+            if ((GLenum)types[i] == GL_GEOMETRY_SHADER) {
+                bool ours = false;
+                for (auto& kv : g_flatGs) ours |= kv.second == shaders[i] && kv.first.first == t_ctx->rc;
+                if (!ours) return 0;   // the game has its own geometry shader
+                detach.push_back(shaders[i]);   // relink: attach the one matching the current vertex shaders
+            } else if ((GLenum)types[i] == GL_VERTEX_SHADER) {
+                auto it = g_vsInfo.find(shaders[i]);
+                if (it == g_vsInfo.end()) {
+                    incomplete = true;   // not analysed (or failed): its outputs would not get through
+                    continue;
+                }
+                renamed.push_back(shaders[i]);
+                if (!vs) {
+                    vs = shaders[i];
+                    info = it->second;
+                } else {
+                    MergeVsInfo(info, it->second);
+                }
+            }
+        }
+    }
+    for (GLuint d : detach) R.DetachShader(prog, d);
+    if (!vs) return 0;
+    if (incomplete) {
+        Log("flat depth: program %u has a vertex shader piece that could not be analysed - no geometry shader", prog);
+        for (GLuint r : renamed) UnrenameVertexShader(r);
+        return 0;
+    }
+    Ctx* c = t_ctx;
+    std::string src = BuildFlatGs(info, !c || c->compat);
+    GLuint gs = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_lock);
+        auto it = g_flatGs.find({c->rc, src});
+        if (it != g_flatGs.end()) gs = it->second;
+    }
+    if (!gs) {
+        gs = R.CreateShader(GL_GEOMETRY_SHADER);
+        const GLchar* p = src.c_str();
+        R.ShaderSource(gs, 1, &p, nullptr);
+        R.CompileShader(gs);
+        GLint ok = 0;
+        R.GetShaderiv(gs, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            char log[2048] = {};
+            R.GetShaderInfoLog(gs, sizeof(log) - 1, nullptr, log);
+            Log("flat depth: geometry shader failed to compile:\n%s\n%s", log, src.c_str());
+            R.DeleteShader(gs);
+            UnrenameVertexShader(vs);
+            return 0;
+        }
+        static int logged;
+        if (logged++ < 2) Log("flat depth: geometry shader %u for vertex shader %u:\n%s", gs, vs, src.c_str());
+        std::lock_guard<std::recursive_mutex> lk(g_lock);
+        GLuint& slot = g_flatGs[{c->rc, src}];
+        if (slot) {
+            R.DeleteShader(gs);   // another thread made the same one meanwhile
+            gs = slot;
+        } else {
+            slot = gs;
+        }
+    }
+    R.AttachShader(prog, gs);
+    gsOut = gs;
+    return vs;
+}
+
 void GLAPIENTRY H_LinkProgram(GLuint prog)
 {
+    GLuint gs = 0, flatVs = AttachFlatGs(prog, gs);
+    const ULONGLONG t0 = GetTickCount64();
     R.LinkProgram(prog);
     GLint linked = 0;
     R.GetProgramiv(prog, GL_LINK_STATUS, &linked);
+    const unsigned ms = (unsigned)(GetTickCount64() - t0);
+    if (gs && !linked) {
+        char log[2048] = {};
+        R.GetProgramInfoLog(prog, sizeof(log) - 1, nullptr, log);
+        Log("flat depth: program %u did not link with the geometry shader, linking without:\n%s", prog, log);
+        R.DetachShader(prog, gs);
+        gs = 0;
+        UnrenameVertexShader(flatVs);
+        R.LinkProgram(prog);
+        R.GetProgramiv(prog, GL_LINK_STATUS, &linked);
+    }
     GLint loc = linked ? R.GetUniformLocation(prog, "s3d_P") : -1;
     GLuint shaders[8];
     GLsizei n = 0;
@@ -2482,15 +3373,38 @@ void GLAPIENTRY H_LinkProgram(GLuint prog)
     ProgInfo pi;
     pi.loc = loc;
     pi.locQ = linked ? R.GetUniformLocation(prog, "s3d_Q") : -1;
+    pi.gs = linked && gs;
+    if (linked && R.GetActiveUniform) {   // sampler uniforms, for SampledUnits
+        GLint nu = 0;
+        R.GetProgramiv(prog, GL_ACTIVE_UNIFORMS, &nu);
+        for (GLint i = 0; i < nu; ++i) {
+            char name[128];
+            GLsizei len = 0;
+            GLint size = 0;
+            GLenum type = 0;
+            R.GetActiveUniform(prog, (GLuint)i, sizeof(name), &len, &size, &type, name);
+            const bool sampler = (type >= 0x8B5D && type <= 0x8B64) || (type >= 0x8DC0 && type <= 0x8DD8) ||
+                                 (type >= 0x900C && type <= 0x900F) || (type >= 0x9108 && type <= 0x910D);
+            if (!sampler) continue;
+            const GLint loc0 = R.GetUniformLocation(prog, name);
+            for (GLint k = 0; loc0 >= 0 && k < size; ++k) pi.samplerLocs.push_back(loc0 + k);
+        }
+        pi.samplersKnown = true;
+    }
+    if (pi.gs) {
+        pi.locF = R.GetUniformLocation(prog, "s3d_F");
+        pi.locD = R.GetUniformLocation(prog, "s3d_D");
+        pi.gs = pi.locF >= 0 && pi.locD >= 0;
+    }
     pi.hash = hashes.empty() ? 0 : Fnv1a(hashes.data(), hashes.size() * sizeof(uint32_t));
     auto ov = pi.hash ? g_cfg.overrides.find(pi.hash) : g_cfg.overrides.end();
     if (ov != g_cfg.overrides.end()) pi.mode = ov->second;
     g_prog[prog] = pi;
     if (g_cfg.dumpShaders && pi.hash) DumpProgram(prog, pi.hash, shaders, n);
     static unsigned links;
-    if (++links <= 3 || g_cfg.logLevel >= 2 || pi.mode != kModeStereo)
-        Log("program %u linked=%d s3d_P=%d hash %08x%s%ls", prog, linked, loc, pi.hash,
-            pi.mode != kModeStereo ? " override: " : "", pi.mode != kModeStereo ? ModeName(pi.mode) : L"");
+    if (++links <= 3 || g_cfg.logLevel >= 2 || pi.mode != kModeStereo || g_cfg.flatEnable)
+        Log("program %u linked=%d s3d_P=%d%s hash %08x%s%ls (%u ms)", prog, linked, loc, pi.gs ? " flat-gs" : "", pi.hash,
+            pi.mode != kModeStereo ? " override: " : "", pi.mode != kModeStereo ? ModeName(pi.mode) : L"", ms);
 }
 
 void GLAPIENTRY H_UseProgram(GLuint prog)
@@ -2535,43 +3449,95 @@ void GLAPIENTRY H_ProgramBinary(GLuint prog, GLenum fmt, const void* bin, GLsize
 
 void GLAPIENTRY H_DrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei inst)
 {
+    TraceDraw("DrawArraysInstanced", mode, count);
     StereoDraw([&] { R.DrawArraysInstanced(mode, first, count, inst); });
 }
 
 void GLAPIENTRY H_DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* idx, GLsizei inst)
 {
+    TraceDraw("DrawElementsInstanced", mode, count);
     StereoDraw([&] { R.DrawElementsInstanced(mode, count, type, idx, inst); });
 }
 
 void GLAPIENTRY H_DrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* idx)
 {
+    TraceDraw("DrawRangeElements", mode, count);
     StereoDraw([&] { R.DrawRangeElements(mode, start, end, count, type, idx); });
 }
 
 void GLAPIENTRY H_DrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* idx, GLint base)
 {
+    TraceDraw("DrawElementsBaseVertex", mode, count);
     StereoDraw([&] { R.DrawElementsBaseVertex(mode, count, type, idx, base); });
 }
 
 void GLAPIENTRY H_DrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
                                               const void* idx, GLint base)
 {
+    t_drawMode = mode;
     StereoDraw([&] { R.DrawRangeElementsBaseVertex(mode, start, end, count, type, idx, base); });
 }
 
 void GLAPIENTRY H_DrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* idx,
                                                   GLsizei inst, GLint base)
 {
+    t_drawMode = mode;
     StereoDraw([&] { R.DrawElementsInstancedBaseVertex(mode, count, type, idx, inst, base); });
+}
+
+void GLAPIENTRY H_DrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei inst, GLuint bi)
+{
+    TraceDraw("DrawArraysInstancedBaseInstance", mode, count);
+    StereoDraw([&] { R.DrawArraysInstancedBaseInstance(mode, first, count, inst, bi); });
+}
+
+void GLAPIENTRY H_DrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* idx,
+                                                    GLsizei inst, GLuint bi)
+{
+    TraceDraw("DrawElementsInstancedBaseInstance", mode, count);
+    StereoDraw([&] { R.DrawElementsInstancedBaseInstance(mode, count, type, idx, inst, bi); });
+}
+
+void GLAPIENTRY H_DrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* idx,
+                                                              GLsizei inst, GLint bv, GLuint bi)
+{
+    TraceDraw("DrawElementsInstancedBaseVertexBaseInstance", mode, count);
+    StereoDraw([&] { R.DrawElementsInstancedBaseVertexBaseInstance(mode, count, type, idx, inst, bv, bi); });
+}
+
+void GLAPIENTRY H_DrawArraysIndirect(GLenum mode, const void* ind)
+{
+    TraceDraw("DrawArraysIndirect", mode, -1);
+    StereoDraw([&] { R.DrawArraysIndirect(mode, ind); });
+}
+
+void GLAPIENTRY H_DrawElementsIndirect(GLenum mode, GLenum type, const void* ind)
+{
+    TraceDraw("DrawElementsIndirect", mode, -1);
+    StereoDraw([&] { R.DrawElementsIndirect(mode, type, ind); });
+}
+
+void GLAPIENTRY H_MultiDrawArraysIndirect(GLenum mode, const void* ind, GLsizei n, GLsizei stride)
+{
+    TraceDraw("MultiDrawArraysIndirect", mode, -1);
+    StereoDraw([&] { R.MultiDrawArraysIndirect(mode, ind, n, stride); });
+}
+
+void GLAPIENTRY H_MultiDrawElementsIndirect(GLenum mode, GLenum type, const void* ind, GLsizei n, GLsizei stride)
+{
+    TraceDraw("MultiDrawElementsIndirect", mode, -1);
+    StereoDraw([&] { R.MultiDrawElementsIndirect(mode, type, ind, n, stride); });
 }
 
 void GLAPIENTRY H_MultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei n)
 {
+    t_drawMode = mode;
     StereoDraw([&] { R.MultiDrawArrays(mode, first, count, n); });
 }
 
 void GLAPIENTRY H_MultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const void* const* idx, GLsizei n)
 {
+    t_drawMode = mode;
     StereoDraw([&] { R.MultiDrawElements(mode, count, type, idx, n); });
 }
 
@@ -2664,6 +3630,8 @@ const HookEntry kHooks[] = {
     HOOK("glGenerateMipmap", H_GenerateMipmap, GenerateMipmap),
     HOOK("glGenerateMipmapEXT", H_GenerateMipmap, GenerateMipmap),
     HOOK("glTexStorage2D", H_TexStorage2D, TexStorage2D),
+    HOOK("glTextureView", H_TextureView, TextureView),
+    HOOK("glCopyImageSubData", H_CopyImageSubData, CopyImageSubData),
     HOOK("glTexImage2DMultisample", H_TexImage2DMultisample, TexImage2DMultisample),
     HOOK("glShaderSource", H_ShaderSource, ShaderSource),
     HOOK("glShaderSourceARB", H_ShaderSource, ShaderSource),
@@ -2687,6 +3655,14 @@ const HookEntry kHooks[] = {
     HOOK("glDrawElementsBaseVertex", H_DrawElementsBaseVertex, DrawElementsBaseVertex),
     HOOK("glDrawRangeElementsBaseVertex", H_DrawRangeElementsBaseVertex, DrawRangeElementsBaseVertex),
     HOOK("glDrawElementsInstancedBaseVertex", H_DrawElementsInstancedBaseVertex, DrawElementsInstancedBaseVertex),
+    HOOK("glDrawArraysInstancedBaseInstance", H_DrawArraysInstancedBaseInstance, DrawArraysInstancedBaseInstance),
+    HOOK("glDrawElementsInstancedBaseInstance", H_DrawElementsInstancedBaseInstance, DrawElementsInstancedBaseInstance),
+    HOOK("glDrawElementsInstancedBaseVertexBaseInstance", H_DrawElementsInstancedBaseVertexBaseInstance,
+         DrawElementsInstancedBaseVertexBaseInstance),
+    HOOK("glDrawArraysIndirect", H_DrawArraysIndirect, DrawArraysIndirect),
+    HOOK("glDrawElementsIndirect", H_DrawElementsIndirect, DrawElementsIndirect),
+    HOOK("glMultiDrawArraysIndirect", H_MultiDrawArraysIndirect, MultiDrawArraysIndirect),
+    HOOK("glMultiDrawElementsIndirect", H_MultiDrawElementsIndirect, MultiDrawElementsIndirect),
     HOOK("glMultiDrawArrays", H_MultiDrawArrays, MultiDrawArrays),
     HOOK("glMultiDrawArraysEXT", H_MultiDrawArrays, MultiDrawArrays),
     HOOK("glMultiDrawElements", H_MultiDrawElements, MultiDrawElements),
@@ -2806,6 +3782,7 @@ void OnDeleteContext(HGLRC rc)
     if (it == g_ctx.end()) return;
     if (t_ctx == it->second) t_ctx = nullptr;
     if (g_mainRc == rc) g_mainRc = nullptr;
+    for (auto f = g_flatGs.begin(); f != g_flatGs.end();) f = f->first.first == rc ? g_flatGs.erase(f) : std::next(f);
     delete it->second;
     g_ctx.erase(it);
 }
@@ -2879,6 +3856,31 @@ DWORD WINAPI HangWatch(void*)
 
 }   // namespace
 
+// OGL3D.ini edited while the game runs (tuning without restarting): re-read it. Checked about once
+// a second; our own saves (Ctrl+F7, auto_start) reload the same values.
+void ReloadConfigIfChanged()
+{
+    static FILETIME last;
+    static DWORD lastCheck;
+    DWORD now = GetTickCount();
+    if (now - lastCheck < 1000) return;
+    lastCheck = now;
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExW(IniPath().c_str(), GetFileExInfoStandard, &fa)) return;
+    if (!last.dwLowDateTime && !last.dwHighDateTime) {
+        last = fa.ftLastWriteTime;
+        return;
+    }
+    if (CompareFileTime(&fa.ftLastWriteTime, &last) == 0) return;
+    last = fa.ftLastWriteTime;
+    Sleep(50);   // let the editor finish writing
+    LoadConfig();
+    g_paramVer++;
+    for (auto& kv : g_ctx) kv.second->keyDepth.clear();
+    Log("OGL3D.ini changed - settings reloaded");
+    OsdMessage(KoreanUi() ? L"설정 다시 읽음 (OGL3D.ini)" : L"Settings reloaded (OGL3D.ini)", 2.0);
+}
+
 bool OnSwapBuffers(HDC dc)
 {
     Ctx* c = t_ctx;
@@ -2900,6 +3902,7 @@ bool OnSwapBuffers(HDC dc)
     InterlockedIncrement(&g_watchFrame);
     UpdateWindowSize(c, dc);
     if (c->winW <= 0) return false;
+    KeyHookFor(WindowFromDC(dc));
 
     static LARGE_INTEGER freq, last;
     LARGE_INTEGER now;
@@ -2918,6 +3921,7 @@ bool OnSwapBuffers(HDC dc)
     }
     PollHotkeys(std::min(dt, 0.1f));
     HuntFrameEnd();
+    ReloadConfigIfChanged();
     if (g_cfg.showValues && g_cfg.autoConvergence) UpdateStatus();   // auto keeps changing the value
 
     // what the game did in this frame: F = drew with a clear, p = drew without clearing, . = nothing
@@ -2928,7 +3932,19 @@ bool OnSwapBuffers(HDC dc)
         if (g_framePattern.size() > 120) g_framePattern.erase(0, g_framePattern.size() - 120);
     }
     const bool presented = Compose(c, dc);
+    c->batch = 0;
+    c->drawsInBatch = 0;
+    c->batchPending = false;
+    if (c->frameGroups) c->lastGroupCount = c->frameGroups;
+    ComputeLayout(c);
+    c->frameGroups = 0;
+    c->groupId = 0;
+    c->groupIds.clear();
+    if (c->keyDepth.size() > 4096) c->keyDepth.clear();
     ++g_frame;
+    // Ctrl+F12 also traces the draw calls of the frame after the dumped one
+    g_traceNow = (!g_cfg.traceFrames.empty() && ListedIn(g_cfg.traceFrames, g_frame)) || g_dumpRequested;
+    g_traceDraw = 0;
     if (g_dumpRequested || g_dumpAuto || FrameListed(g_frame)) {
         g_dumpAuto = false;
         DumpFrame(c);
@@ -2964,16 +3980,44 @@ extern "C" {
 
 void WINAPI H_glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
+    TraceDraw("DrawArrays", mode, count);
     StereoDraw([&] { R.DrawArrays(mode, first, count); });
 }
 
 void WINAPI H_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices)
 {
+    TraceDraw("DrawElements", mode, count);
     StereoDraw([&] { R.DrawElements(mode, count, type, indices); });
+}
+
+// A scissor or viewport call after some draws starts a new batch (AGS: room, then UI overlays) -
+// but only within the same framebuffer. Games that render passes into different targets (Door
+// Kickers: background cache, scene, composite) reset scissor/viewport per target; those are not UI.
+void NextBatch()
+{
+    Ctx* c = t_ctx;
+    if (!c || !c->isMain || !c->drawsInBatch) return;
+    c->batchPending = true;   // decided at the next draw, once its framebuffer is bound
+    c->drawsInBatch = 0;
+}
+
+void WINAPI H_glScissor(GLint x, GLint y, GLsizei w, GLsizei h)
+{
+    R.Scissor(x, y, w, h);
+    NextBatch();
+    if (g_traceNow && t_ctx && t_ctx->isMain) Log("T %u.%u Scissor %d,%d,%d,%d", g_frame, g_traceDraw, x, y, w, h);
+}
+
+void WINAPI H_glViewport(GLint x, GLint y, GLsizei w, GLsizei h)
+{
+    R.Viewport(x, y, w, h);
+    NextBatch();
+    if (g_traceNow && t_ctx && t_ctx->isMain) Log("T %u.%u Viewport %d,%d,%d,%d", g_frame, g_traceDraw, x, y, w, h);
 }
 
 void WINAPI H_glClear(GLbitfield mask)
 {
+    TraceDraw("Clear", mask, 0);
     StereoTargetOp([&] { R.Clear(mask); });
 }
 
@@ -3184,6 +4228,7 @@ void WINAPI H_glGetIntegerv(GLenum pname, GLint* data)
 // eye, then the list is replayed into the right eye.
 void WINAPI H_glBegin(GLenum mode)
 {
+    t_drawMode = mode;
     Ctx* c = t_ctx;
     if (c && !c->listMode && c->drawFb == 0) c->fb0Touched = true;
     if (c && !c->listMode && Active(c)) {

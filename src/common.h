@@ -2,6 +2,7 @@
 #include "glapi.h"
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 // Log to OGL3D.log next to the DLL; every line is flushed (a crash must not eat the tail).
 void Log(const char* fmt, ...);
@@ -32,6 +33,18 @@ struct Config {
     bool fixedFunction = true;    // per-eye projection matrix for draws without an injected shader
     float orthoDepth = 0.0f;      // != 0: flat (w == 1) geometry gets depth from its clip z, scaled by this
     float orthoConvergence = 0.0f;   // clip z that sits on the screen plane in ortho depth mode
+    // [Flat] layered depth for flat 2D games (geometry shader behind the game's vertex shaders)
+    bool flatEnable = false;
+    int flatRule = 0;             // 0 = feet (adventure: floor slope, sprites at their bottom edge), 1 = order (layers by draw order)
+    float flatTop = 1.0f;         // depth at the top of the screen (bottom = 0), in units of separation
+    float flatZero = 0.0f;        // depth that sits on the screen plane
+    float flatPlane = 1.2f;       // a quad at least this wide (NDC, 2 = screen) is a plane (background layer, overlay)
+    float flatPlaneHeight = 0.0f; // ... and at least this high (AGS: 1.8, so wide walk-behinds stay sprites)
+    float flatSpriteMin = -0.25f; // sprites never come nearer than this depth
+    int flatScreenBatch = 1;      // draws from this scissor/viewport batch on stay at screen depth (0 = off)
+    float flatCacheScale = 0.0f;  // offset scale inside off-screen layer caches (0 = auto: scissored part of the viewport)
+    bool flatGroupByDraw = false; // order rule: every draw call is a layer (Unity), not a run of draws with the same program and textures
+    float flatOrderCurve = 1.0f;  // order rule: depth = 1 - place^curve; < 1 gives the first (far) layers more depth
     // [Inject]
     bool inject = true;
     bool blockProgramBinary = true;
@@ -56,6 +69,7 @@ struct Config {
     Hotkey keyShowValues{VK_F1, true};
     Hotkey keyAutoConv{VK_F2, true};
     Hotkey keyHunt{VK_F9, true}, keyHuntPrev{VK_F10, true}, keyHuntNext{VK_F11, true}, keyHuntMode{VK_F8, true};
+    bool swallowKeys = true;      // the game does not receive the keyboard messages of our hotkeys
     // [SR]
     int srLatencyFrames = 1;
     bool srWeaverHwnd = true;
@@ -64,6 +78,8 @@ struct Config {
     // [Debug]
     int logLevel = 1;
     std::string dumpFrames;       // comma separated frame numbers to save as BMP
+    std::string traceFrames;      // comma separated frame numbers whose draw calls are logged
+    bool traceSteps = false;      // traced frames also save each draw's target as an image
     int statsEvery = 600;         // log per-frame counters every N frames (0 = never)
     bool logCrashes = true;       // log first-chance faults with module offsets and stack
     bool flickerProbe = false;    // log frames whose eye images jump against both neighbours
@@ -108,3 +124,21 @@ void OsdRender(GLuint fbo, int vx, int vy, int vw, int vh, int W, int H, bool co
 
 // inject.cpp
 bool InjectVertexShader(const std::string& src, std::string& out);
+struct VsOutput {
+    std::string quals, type, name, arr;   // arr: "[8]" for array outputs
+};
+struct VsBlock {
+    std::string layout, name, inst, body;   // out <name> { <body> } <inst>;
+    std::vector<std::string> members;
+};
+struct VsInfo {
+    int version = 110;
+    bool core = false;
+    std::vector<VsOutput> outs;
+    std::vector<VsBlock> blocks;
+    unsigned builtins = 0;        // compatibility outputs written (gl_FrontColor ...)
+    int texCoords = 0, clipDistances = 0;
+    std::string renamed;          // injected source with the outputs renamed s3d_v_<name>
+};
+bool AnalyzeVertexShader(const std::string& injected, VsInfo& info, std::string& why);
+std::string BuildFlatGs(const VsInfo& vs, bool compatContext);
