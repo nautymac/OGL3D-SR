@@ -818,11 +818,18 @@ void ComputeLayout(Ctx* c)
             }
             cursor = SIZE_MAX;
         }
-        if (e.count <= 12 || e.sc[2] < 0) continue;
+        if (e.count <= 12) continue;
+        auto same = [](const FlatEv& x, const FlatEv& y) { return x.fb == y.fb && x.prog == y.prog && x.count == y.count; };
         for (size_t q = 0; q < s; ++q) {
             const FlatEv& p = ev[starts[q]];
-            if (p.fb == e.fb && p.prog == e.prog && p.count == e.count && p.key != e.key && memcmp(p.sc, e.sc, sizeof(p.sc)) != 0) {
-                alias[e.key] = p.key;
+            if (!same(p, e) || p.key == e.key) continue;
+            // a repeat: drawn into another scissor region, or the next group repeats the one after
+            // p as well (FRAMED draws each comic panel as frame + picture: the panels are one layer)
+            const bool otherRegion = e.sc[2] >= 0 && memcmp(p.sc, e.sc, sizeof(p.sc)) != 0;
+            const bool runRepeats = q + 1 < s && s + 1 < starts.size() && same(ev[starts[q + 1]], ev[starts[s + 1]]);
+            if (otherRegion || runRepeats) {
+                auto pa = alias.find(p.key);
+                alias[e.key] = pa != alias.end() ? pa->second : p.key;
                 cursor = q + 1;
                 break;
             }
