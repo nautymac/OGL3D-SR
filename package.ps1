@@ -19,6 +19,15 @@ Copy-Item (Join-Path $root 'bin\x86\opengl32.dll') (Join-Path $stage 'x86')
 foreach ($f in 'OGL3D.ini', 'README.md', 'README.ko.md', 'LICENSE') { Copy-Item (Join-Path $root $f) $stage }
 $zip = Join-Path $root "dist\OGL3D-v$ver.zip"
 Remove-Item $zip -ErrorAction SilentlyContinue
-Compress-Archive -Path $stage -DestinationPath $zip
+# entry names with '/' (Compress-Archive of Windows PowerShell 5.1 writes '\', which unzip tools outside Windows keep
+# as part of the file name); each entry keeps its file's timestamp
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+$za = [System.IO.Compression.ZipFile]::Open($zip, 'Create')
+try {
+    foreach ($f in Get-ChildItem $stage -Recurse -File) {
+        $name = 'OGL3D/' + $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
+        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($za, $f.FullName, $name, 'Optimal') | Out-Null
+    }
+} finally { $za.Dispose() }
 Remove-Item (Join-Path $root 'dist\stage') -Recurse -Force
 Write-Host "packaged: $zip ($((Get-Item $zip).Length) bytes)"

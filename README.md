@@ -105,7 +105,7 @@ Fixed during testing: flicker caused by Windows showing a half-drawn back buffer
 
 ## Troubleshooting
 
-- **The log:** `OGL3D.log` next to the exe records the GL version, injected shaders, render targets, SR status, auto-convergence decisions, frame statistics, crashes (module + offset + stack) and stalls (`HANG?`).
+- **The log:** `OGL3D.log` next to the exe records the GL version, injected shaders, render targets, SR status, auto-convergence decisions, frame statistics, crashes (module + offset + stack) and stalls (`HANG?`). `EXCEPTION` lines from `DimencoWeaving*.dll` (or an address without a module) right after start-up come from the SR runtime testing CPU features; it handles them itself, so they matter only if the game then closes.
 - **Frame dumps:** **Ctrl+F12** writes `OGL3D_frameNNNNN.bmp` (both eyes) and `_srinput.bmp` (what the weaver received), plus a disparity grid in the log.
 - **One eye wrong, or an effect at the wrong depth:** use hunting mode (Ctrl+F9). Step to the shader (the selected one disappears), set it to mono or skip with Ctrl+F8, and save with Ctrl+F7.
 - **Flicker hunting:** `[Debug] flicker_probe = 1`. `bin\tools\flickercap.exe <seconds> <folder>` records what the display really shows (DXGI desktop duplication) and saves sheets of single-frame flashes.
