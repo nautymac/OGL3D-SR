@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(flickercap CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+add_executable(flickercap flickercap.cpp)
+target_compile_definitions(flickercap PRIVATE UNICODE _UNICODE)
+set_target_properties(flickercap PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/../../bin/tools)

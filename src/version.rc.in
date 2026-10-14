@@ -1,0 +1,31 @@
+// Version information for opengl32.dll (configured by CMake from the project version).
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+ PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "nautymac"
+            VALUE "FileDescription", "OGL3D - stereo 3D for OpenGL games (opengl32.dll proxy)"
+            VALUE "FileVersion", "@PROJECT_VERSION@"
+            VALUE "InternalName", "OGL3D"
+            VALUE "LegalCopyright", "MIT License"
+            VALUE "OriginalFilename", "opengl32.dll"
+            VALUE "ProductName", "OGL3D"
+            VALUE "ProductVersion", "@PROJECT_VERSION@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

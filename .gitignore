@@ -1,0 +1,14 @@
+# build trees (bin\ keeps the prebuilt opengl32.dll files and flickercap.exe)
+build/
+build-x86/
+build-flickercap/
+bin/**/*.map
+
+# release packages (package.ps1)
+dist/
+
+# local test data: game save backups, logs, frame dumps
+test-backups/
+*.log
+OGL3D_frame*.bmp
+OGL3D_flicker*.bmp
