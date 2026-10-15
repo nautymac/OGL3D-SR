@@ -79,6 +79,13 @@ enum : unsigned {
     kBiClipVertex = 32, kBiPointSize = 64,
 };
 
+// The vertex shader's name for an output the geometry shader passes on. GLSL reserves names with
+// "__", so an output that starts with "_" (LÖVE's shaders) gets "s3d_vx" instead of "s3d_v_".
+static std::string RenamedOutput(const std::string& name)
+{
+    return (!name.empty() && name[0] == '_' ? "s3d_vx" : "s3d_v_") + name;
+}
+
 static int MaxLiteralIndex(const std::string& code, const char* name, bool& dynamic)
 {
     int best = -1;
@@ -197,7 +204,7 @@ bool AnalyzeVertexShader(const std::string& injected, VsInfo& info, std::string&
     info.renamed = injected;
     for (const VsOutput& o : info.outs) {
         std::regex re("(^|[^.\\w])" + o.name + "\\b");
-        info.renamed = std::regex_replace(info.renamed, re, "$1s3d_v_" + o.name);
+        info.renamed = std::regex_replace(info.renamed, re, "$1" + RenamedOutput(o.name));
     }
     return true;
 }
@@ -220,7 +227,7 @@ uniform vec4 s3d_D; // x = 1: this draw stays at screen depth; feet rule: y = ne
 )";
     for (const VsOutput& o : vs.outs) {
         std::string q = o.quals;
-        s += q + "in " + o.type + " s3d_v_" + o.name + "[]" + o.arr + ";\n";
+        s += q + "in " + o.type + " " + RenamedOutput(o.name) + "[]" + o.arr + ";\n";
         s += q + "out " + o.type + " " + o.name + o.arr + ";\n";
     }
     for (size_t k = 0; k < vs.blocks.size(); ++k) {
@@ -258,7 +265,7 @@ void main()
         gl_Position = gl_in[s3d_i].gl_Position;
         gl_Position.x += s3d_sh[s3d_i] * gl_Position.w;
 )";
-    for (const VsOutput& o : vs.outs) s += "        " + o.name + " = s3d_v_" + o.name + "[s3d_i];\n";
+    for (const VsOutput& o : vs.outs) s += "        " + o.name + " = " + RenamedOutput(o.name) + "[s3d_i];\n";
     for (size_t k = 0; k < vs.blocks.size(); ++k)
         for (const std::string& m : vs.blocks[k].members)
             s += "        " + vs.blocks[k].inst + "." + m + " = s3d_b" + std::to_string(k) + "[s3d_i]." + m + ";\n";
