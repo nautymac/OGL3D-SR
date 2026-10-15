@@ -11,7 +11,7 @@ OGL3D는 **OpenGL** 게임을 입체 3D로 보여 줍니다. geo-11이 DirectX 1
 - **2D는 평면 그대로:** HUD 같은 2D 요소는 화면 깊이에 그대로 둡니다.
 - **자동 컨버전스(기본값):** 양쪽 눈 영상을 측정해 가장 가까운 물체를 화면 면에 맞추고, 카메라 컷에도 따라갑니다.
 
-DirectX 게임은 자매 프로젝트 [geo-11 SR](https://github.com/nautymac/geo-11_SR)이 맡습니다. geo-11 SR v0.3.0부터는 그 설치기로 OGL3D도 설치할 수 있습니다(종류 **OpenGL**).
+DirectX 게임은 자매 프로젝트 [geo-11 SR](https://github.com/nautymac/geo-11_SR)이 맡습니다.
 
 ## 내려받기와 설치
 
@@ -31,9 +31,7 @@ OGL3D\
 
 제거하려면 `opengl32.dll`, `OGL3D.ini`, `OGL3D.log`를 지웁니다.
 
-[geo-11 SR 설치기](https://github.com/nautymac/geo-11_SR)(v0.3.0 이상)를 쓰면 이 과정을 대신 해 줍니다. OpenGL 게임을 감지하고, 32/64비트를 고르고, 업스케일을 켜고 끌 수 있습니다.
-
-OpenGL 게임인지는 exe가 `opengl32.dll`을 가져오는지, 또는 게임 설정에 OpenGL 렌더러가 있는지로 압니다. 설치기는 자동으로 확인합니다. `OGL3D.log`가 끝내 생기지 않으면 그 게임은 OpenGL을 쓰지 않는 것입니다.
+OpenGL 게임인지는 exe가 `opengl32.dll`을 가져오는지, 또는 게임 설정에 OpenGL 렌더러가 있는지로 압니다. `OGL3D.log`가 끝내 생기지 않으면 그 게임은 OpenGL을 쓰지 않는 것입니다.
 
 ## 필요한 것
 
@@ -122,7 +120,7 @@ OpenGL 게임인지는 exe가 `opengl32.dll`을 가져오는지, 또는 게임 �
 
 - **helifax의 [OGL-3DVision-Wrapper](https://github.com/helifax/OGL-3DVision-Wrapper)**: OpenGL 3D Vision 래퍼. OpenGL 입체 주입 방식과 게임 프로필을 참고했습니다. 코드는 가져오지 않았습니다.
 - **SR SDK / SR Platform:** Leia Inc. / Acer SpatialLabs. 포함되어 있지 않으며, 설치된 SR 런타임에서 실행 시 불러옵니다.
-- **[geo-11 SR](https://github.com/nautymac/geo-11_SR):** DirectX 게임용 자매 프로젝트. 그 설치기로 OGL3D도 설치할 수 있습니다.
+- **[geo-11 SR](https://github.com/nautymac/geo-11_SR):** DirectX 게임용 자매 프로젝트.
 
 이 저장소의 코드는 MIT 라이선스입니다. `LICENSE`를 보세요.
 

@@ -11,7 +11,7 @@ The games tested so far needed no per-game shader fixes:
 - **2D stays flat:** HUD and other 2D elements stay at screen depth.
 - **Auto-convergence (default):** measures the two eyes and keeps the nearest content at the screen surface, following camera cuts.
 
-DirectX games are covered by the sister project [geo-11 SR](https://github.com/nautymac/geo-11_SR). From geo-11 SR v0.3.0, its installer also installs OGL3D (kind **OpenGL**).
+DirectX games are covered by the sister project [geo-11 SR](https://github.com/nautymac/geo-11_SR).
 
 ## Download and install
 
@@ -31,9 +31,7 @@ OGL3D\
 
 To uninstall, delete `opengl32.dll`, `OGL3D.ini` and `OGL3D.log`.
 
-The [geo-11 SR installer](https://github.com/nautymac/geo-11_SR) (v0.3.0 and later) does this for you. It detects OpenGL games, picks 32/64-bit and sets upscale on or off.
-
-Is the game OpenGL? Its exe imports `opengl32.dll`, or the game offers an OpenGL renderer. The installer checks this automatically. If the wrapper never writes `OGL3D.log`, the game is not using OpenGL.
+Is the game OpenGL? Its exe imports `opengl32.dll`, or the game offers an OpenGL renderer. If the wrapper never writes `OGL3D.log`, the game is not using OpenGL.
 
 ## Requirements
 
@@ -122,7 +120,7 @@ Fixed during testing: flicker caused by Windows showing a half-drawn back buffer
 
 - **helifax's [OGL-3DVision-Wrapper](https://github.com/helifax/OGL-3DVision-Wrapper)**, the OpenGL 3D Vision wrapper, studied as a reference for OpenGL stereo injection and its game profiles. No code was taken from it.
 - **SR SDK / SR Platform:** Leia Inc. / Acer SpatialLabs. Not included; loaded at run time from the installed SR runtime.
-- **[geo-11 SR](https://github.com/nautymac/geo-11_SR):** the sister project for DirectX games; its installer also installs OGL3D.
+- **[geo-11 SR](https://github.com/nautymac/geo-11_SR):** the sister project for DirectX games.
 
 The code in this repository is MIT licensed, see `LICENSE`.
 
