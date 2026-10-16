@@ -90,6 +90,8 @@ struct ProgInfo {
     GLint locF = -1, locD = -1;
     unsigned fVer = 0;
     float lastD[4] = {NAN, NAN, NAN, NAN};   // s3d_D last written
+    GLint locS = -1;          // s3d_S: silhouette depth in the fragment shader ([Flat] silhouette)
+    float lastS = NAN;
     // texture units its samplers read (SampledUnits); read once at its first draw, after the engine
     // has set the sampler uniforms
     bool samplersKnown = false;
@@ -973,6 +975,7 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
                             g_cfg.flatPlane, g_cfg.flatZero);
                 pi->fVer = g_paramVer;
                 pi->lastD[0] = NAN;
+                pi->lastS = NAN;
             }
             // screen depth: later batches (UI), and passes that read a stereo render target (the
             // scene already drawn per eye being composited or post-processed)
@@ -981,12 +984,13 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
             float w = order ? c->orderDepth * g_cfg.flatTop - g_cfg.flatZero : 0.0f;
             // order rule: a draw spreads over 80% of its group's slot, so groups never overlap
             float slot = order ? c->orderSlot * g_cfg.flatTop * 0.8f : 0.0f;
+            float scale = 1.0f;
             if (d == 0.0f && order && c->drawFb) {
                 auto f = c->fbo.find(c->drawFb);
                 if (f != c->fbo.end() && f->second.promoted) {
                     // layer cache: its offset is scaled to the part of it that fills the screen (the
                     // scissored region), so a layer moves as far on screen as one drawn there directly
-                    float scale = g_cfg.flatCacheScale;
+                    scale = g_cfg.flatCacheScale;
                     if (scale <= 0.0f) {
                         scale = 1.0f;
                         GLint vp[4] = {}, sc[4] = {};
@@ -1004,6 +1008,22 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
             if (memcmp(v, pi->lastD, sizeof(v)) != 0) {
                 R.Uniform4f(pi->locD, v[0], v[1], v[2], v[3]);
                 memcpy(pi->lastD, v, sizeof(v));
+            }
+            if (pi->locS >= 0) {
+                // silhouette depth: dark pixels of the picture sit silhouette_depth nearer than the
+                // picture, as a shift in pixels of the target (NDC offset * half the viewport width)
+                float s = 0.0f;
+                if (d == 0.0f && eye != 0.0f) {
+                    GLint vp[4] = {};
+                    R.GetIntegerv(GL_VIEWPORT, vp);
+                    s = -eye * SepValue() * g_cfg.silDepth * g_cfg.flatTop * scale * (float)vp[2] * 0.5f;
+                    static int logged;
+                    if (logged++ < 4) Log("silhouette depth: program %u eye %+.0f shift %.1f px (viewport %d, group depth %.3f)", c->program, eye, s, vp[2], w);
+                }
+                if (s != pi->lastS) {
+                    R.Uniform4f(pi->locS, s, g_cfg.silThreshold, 0.0f, 0.0f);
+                    pi->lastS = s;
+                }
             }
         }
         return;
@@ -3173,7 +3193,8 @@ void GLAPIENTRY H_TexImage2DMultisample(GLenum target, GLsizei samples, GLenum i
     BumpStamp();
 }
 
-std::unordered_map<GLuint, std::string> g_shaderSrc;   // original sources, kept only for dump_shaders
+std::unordered_map<GLuint, std::string> g_shaderSrc;   // original sources, kept only for dump_shaders and silhouette
+std::unordered_set<GLuint> g_silFs;                    // fragment shaders holding the silhouette rewrite
 
 // dump_shaders: OGL3D_shaders\prog_<hash>.glsl holds every shader of a program (the hash the
 // hunting overlay shows), so an effect found while hunting can be identified.
@@ -3217,7 +3238,8 @@ void GLAPIENTRY H_ShaderSource(GLuint sh, GLsizei count, const GLchar* const* st
     {
         std::lock_guard<std::recursive_mutex> lk(g_lock);
         g_shaderHash[sh] = Fnv1a(src.data(), src.size());   // identifies programs for [ShaderOverride]
-        if (g_cfg.dumpShaders) g_shaderSrc[sh] = src;
+        if (g_cfg.dumpShaders || !g_cfg.silhouette.empty()) g_shaderSrc[sh] = src;
+        g_silFs.erase(sh);
     }
     GLint type = 0;
     if (g_cfg.inject && R.GetShaderiv) R.GetShaderiv(sh, GL_SHADER_TYPE, &type);
@@ -3412,8 +3434,64 @@ GLuint AttachFlatGs(GLuint prog, GLuint& gsOut)
     return vs;
 }
 
+// [Flat] silhouette: rewrites the fragment shader of a listed program before it links (see
+// InjectSilhouette). The shader object keeps the rewrite in every program it is linked into; s3d_S
+// stays 0 there, which leaves the picture as it was.
+void SilhouetteRewrite(GLuint prog)
+{
+    if (g_cfg.silhouette.empty() || !t_ctx || t_ownShaders || !R.GetAttachedShaders) return;
+    GLuint shaders[8];
+    GLsizei n = 0;
+    R.GetAttachedShaders(prog, 8, &n, shaders);
+    GLint types[8] = {};
+    for (GLsizei i = 0; i < n; ++i) R.GetShaderiv(shaders[i], GL_SHADER_TYPE, &types[i]);
+    GLuint fs = 0;
+    uint32_t hash = 0;
+    std::string src;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_lock);
+        std::vector<uint32_t> hashes;
+        for (GLsizei i = 0; i < n; ++i) {
+            auto it = g_shaderHash.find(shaders[i]);
+            if (it != g_shaderHash.end()) hashes.push_back(it->second);
+        }
+        std::sort(hashes.begin(), hashes.end());
+        hash = hashes.empty() ? 0 : Fnv1a(hashes.data(), hashes.size() * sizeof(uint32_t));
+        if (std::find(g_cfg.silhouette.begin(), g_cfg.silhouette.end(), hash) == g_cfg.silhouette.end()) return;
+        for (GLsizei i = 0; i < n && !fs; ++i)
+            if ((GLenum)types[i] == GL_FRAGMENT_SHADER) fs = shaders[i];
+        if (!fs || g_silFs.count(fs)) return;
+        auto it = g_shaderSrc.find(fs);
+        if (it == g_shaderSrc.end()) return;
+        src = it->second;
+    }
+    std::string out, why;
+    if (!InjectSilhouette(src, g_cfg.silUv, g_cfg.silTex, out, why)) {
+        Log("silhouette depth: fragment shader %u of program %u (hash %08x) left as is: %s", fs, prog, hash, why.c_str());
+        return;
+    }
+    const GLchar* p = out.c_str();
+    R.ShaderSource(fs, 1, &p, nullptr);
+    R.CompileShader(fs);
+    GLint ok = 0;
+    R.GetShaderiv(fs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[2048] = {};
+        R.GetShaderInfoLog(fs, sizeof(log) - 1, nullptr, log);
+        Log("silhouette depth: rewritten fragment shader %u failed to compile, using the original:\n%s", fs, log);
+        p = src.c_str();
+        R.ShaderSource(fs, 1, &p, nullptr);
+        R.CompileShader(fs);
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    g_silFs.insert(fs);
+    Log("silhouette depth: fragment shader %u of program %u (hash %08x) rewritten", fs, prog, hash);
+}
+
 void GLAPIENTRY H_LinkProgram(GLuint prog)
 {
+    SilhouetteRewrite(prog);
     GLuint gs = 0, flatVs = AttachFlatGs(prog, gs);
     const ULONGLONG t0 = GetTickCount64();
     R.LinkProgram(prog);
@@ -3466,6 +3544,7 @@ void GLAPIENTRY H_LinkProgram(GLuint prog)
         pi.locF = R.GetUniformLocation(prog, "s3d_F");
         pi.locD = R.GetUniformLocation(prog, "s3d_D");
         pi.gs = pi.locF >= 0 && pi.locD >= 0;
+        if (!g_cfg.silhouette.empty()) pi.locS = R.GetUniformLocation(prog, "s3d_S");
     }
     pi.hash = hashes.empty() ? 0 : Fnv1a(hashes.data(), hashes.size() * sizeof(uint32_t));
     auto ov = pi.hash ? g_cfg.overrides.find(pi.hash) : g_cfg.overrides.end();
@@ -3474,8 +3553,9 @@ void GLAPIENTRY H_LinkProgram(GLuint prog)
     if (g_cfg.dumpShaders && pi.hash) DumpProgram(prog, pi.hash, shaders, n);
     static unsigned links;
     if (++links <= 3 || g_cfg.logLevel >= 2 || pi.mode != kModeStereo || g_cfg.flatEnable)
-        Log("program %u linked=%d s3d_P=%d%s hash %08x%s%ls (%u ms)", prog, linked, loc, pi.gs ? " flat-gs" : "", pi.hash,
-            pi.mode != kModeStereo ? " override: " : "", pi.mode != kModeStereo ? ModeName(pi.mode) : L"", ms);
+        Log("program %u linked=%d s3d_P=%d%s%s hash %08x%s%ls (%u ms)", prog, linked, loc, pi.gs ? " flat-gs" : "",
+            pi.locS >= 0 ? " silhouette" : "", pi.hash, pi.mode != kModeStereo ? " override: " : "",
+            pi.mode != kModeStereo ? ModeName(pi.mode) : L"", ms);
 }
 
 void GLAPIENTRY H_UseProgram(GLuint prog)

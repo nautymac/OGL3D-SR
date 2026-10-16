@@ -45,6 +45,11 @@ struct Config {
     float flatCacheScale = 0.0f;  // offset scale inside off-screen layer caches (0 = auto: scissored part of the viewport)
     bool flatGroupByDraw = false; // order rule: every draw call is a layer (Unity), not a run of draws with the same program and textures
     float flatOrderCurve = 1.0f;  // order rule: depth = 1 - place^curve; < 1 gives the first (far) layers more depth
+    // silhouette depth: in these programs' pictures, dark pixels come nearer than the picture
+    std::vector<uint32_t> silhouette;   // program hashes
+    std::string silUv = "texcoordOut", silTex = "texture1";   // fragment shader varying and sampler of the picture
+    float silDepth = 0.3f;        // how much nearer, as a part of depth_top
+    float silThreshold = 0.15f;   // brightness (max of r, g, b) below which a pixel counts as dark
     // [Inject]
     bool inject = true;
     bool blockProgramBinary = true;
@@ -124,6 +129,8 @@ void OsdRender(GLuint fbo, int vx, int vy, int vw, int vh, int W, int H, bool co
 
 // inject.cpp
 bool InjectVertexShader(const std::string& src, std::string& out);
+bool InjectSilhouette(const std::string& src, const std::string& uv, const std::string& tex, std::string& out,
+                      std::string& why);
 struct VsOutput {
     std::string quals, type, name, arr;   // arr: "[8]" for array outputs
 };

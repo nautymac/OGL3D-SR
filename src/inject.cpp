@@ -68,6 +68,57 @@ bool InjectVertexShader(const std::string& src, std::string& out)
     return true;
 }
 
+// Silhouette depth ([Flat] silhouette): a picture drawn as one image (FRAMED's comic panels are
+// videos) gets a second depth inside it. The fragment shader samples the picture through a
+// coordinate shifted per eye wherever the shifted or the unshifted pixel is dark, so dark figures
+// stand in front of the picture, and the place they left shows the picture next to them. The varying
+// <uv> keeps its name (it links to the previous stage); after its declaration the game's code reads
+// the global s3d_sil_uv instead, which our main() fills before it calls the game's (now s3d_main1),
+// so every texture read with <uv> moves the same way.
+bool InjectSilhouette(const std::string& src, const std::string& uv, const std::string& tex, std::string& out,
+                      std::string& why)
+{
+    static const std::regex identRe(R"(^[A-Za-z_]\w*$)");
+    if (!std::regex_match(uv, identRe) || !std::regex_match(tex, identRe)) { why = "bad silhouette_uv/silhouette_tex name"; return false; }
+    if (src.find("s3d_main1") != std::string::npos) { why = "already rewritten"; return false; }
+    const std::string code = BlankComments(src);
+    std::smatch m;
+    int version = 110;
+    static const std::regex verRe(R"(#[ \t]*version[ \t]+(\d+))");
+    if (std::regex_search(code, m, verRe)) version = std::stoi(m[1].str());
+    if (!std::regex_search(code, std::regex("\\b" + tex + "\\b"))) { why = "no sampler " + tex; return false; }
+    // the declaration: only its name changes, so the match may start early (at "#define varying in")
+    if (!std::regex_search(code, m, std::regex("\\b(varying|in)\\b[^;{}]*?\\b(\\w+)\\s+" + uv + "\\s*;"))) {
+        why = "no varying " + uv;
+        return false;
+    }
+    if (m[2].str() != "vec2") { why = uv + " is " + m[2].str() + ", not vec2"; return false; }
+    const size_t declEnd = (size_t)(m.position(0) + m.length(0));
+    static const std::regex mainRe(R"(\bvoid\s+main\s*\()");
+    std::vector<size_t> mains;
+    for (auto it = std::sregex_iterator(code.begin(), code.end(), mainRe); it != std::sregex_iterator(); ++it)
+        mains.push_back(code.find("main", (size_t)it->position(0)));
+    if (mains.size() != 1 || mains[0] < declEnd) { why = "main() not found after the declaration"; return false; }
+    std::string body = src.substr(declEnd, mains[0] - declEnd) + "s3d_main1" + src.substr(mains[0] + 4);
+    body = std::regex_replace(body, std::regex("\\b" + uv + "\\b"), "s3d_sil_uv");
+    const char* fetch = version >= 130 ? "texture" : "texture2D";
+    out = src.substr(0, declEnd) + " vec2 s3d_sil_uv;" + body;
+    out += "\n// --- OGL3D silhouette depth ---\n"
+           "uniform vec4 s3d_S; // x = shift of dark pixels for this eye (target pixels), y = darkness threshold\n"
+           "float s3d_lum(vec2 s3d_c) { vec3 s3d_t = " + std::string(fetch) + "(" + tex + ", s3d_c).rgb; return max(s3d_t.r, max(s3d_t.g, s3d_t.b)); }\n"
+           "void main()\n"
+           "{\n"
+           "    vec2 s3d_uv = " + uv + ";\n"
+           "    if (s3d_S.x != 0.0) {\n"
+           "        vec2 s3d_moved = s3d_uv - dFdx(" + uv + ") * s3d_S.x;\n"
+           "        if (min(s3d_lum(s3d_moved), s3d_lum(s3d_uv)) < s3d_S.y) s3d_uv = s3d_moved;\n"
+           "    }\n"
+           "    s3d_sil_uv = s3d_uv;\n"
+           "    s3d_main1();\n"
+           "}\n";
+    return true;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Flat depth ([Flat]): a geometry shader behind the game's vertex shader sees whole triangles, so
 // every 2D sprite knows its own screen rectangle (any 3 corners of a quad span it) without a CPU

@@ -157,7 +157,23 @@ void LoadConfig()
     c.flatCacheScale = IniFloat(L"Flat", L"cache_scale", c.flatCacheScale);
     c.flatGroupByDraw = _wcsicmp(IniStr(L"Flat", L"group", L"texture").c_str(), L"draw") == 0;
     c.flatOrderCurve = IniFloat(L"Flat", L"order_curve", c.flatOrderCurve);
-    c.inject = IniInt(L"Inject", L"enable", c.inject) != 0;
+    c.silhouette.clear();
+    {
+        std::wstring list = IniStr(L"Flat", L"silhouette", L"");
+        for (const wchar_t* p = list.c_str(); *p;) {
+            wchar_t* end = nullptr;
+            uint32_t hash = (uint32_t)wcstoul(p, &end, 16);
+            if (end == p) { ++p; continue; }
+            if (hash) c.silhouette.push_back(hash);
+            p = end;
+        }
+    }
+    auto ascii = [](const std::wstring& w) { std::string s; for (wchar_t ch : w) s += (char)(ch < 128 ? ch : '?'); return s; };
+    c.silUv = ascii(IniStr(L"Flat", L"silhouette_uv", L"texcoordOut"));
+    c.silTex = ascii(IniStr(L"Flat", L"silhouette_tex", L"texture1"));
+    c.silDepth = IniFloat(L"Flat", L"silhouette_depth", c.silDepth);
+    c.silThreshold = IniFloat(L"Flat", L"silhouette_threshold", c.silThreshold);
+    c.inject =IniInt(L"Inject", L"enable", c.inject) != 0;
     c.blockProgramBinary = IniInt(L"Inject", L"block_program_binary", c.blockProgramBinary) != 0;
     c.dumpShaders = IniInt(L"Inject", L"dump_shaders", c.dumpShaders) != 0;
     c.minTargetWidth = IniInt(L"Targets", L"min_width", c.minTargetWidth);
