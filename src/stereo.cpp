@@ -181,6 +181,19 @@ struct Ctx {
     float orderSlot = 0.0f;   // depth between neighbouring groups
     float drawPrims = 0.0f;   // triangles in the draw being issued (0 = unknown)
     std::vector<FlatEv> flatEvents;                    // this frame's draws
+    struct FfBox {                                     // a fixed-function draw's extent (NDC) and layer
+        GLuint fb;
+        float lo[2], hi[2];
+        uint64_t key;
+    };
+    std::vector<FfBox> ffBoxes;                        // this frame's, in drawing order
+    struct Picture {                                   // a textured fixed-function draw and its layer (FfContinues)
+        GLuint fb, tex;
+        float m[6];
+        uint64_t key;
+        size_t box;                                    // its entry in ffBoxes
+    };
+    std::vector<Picture> pictures;                     // this frame's
     std::unordered_map<GLuint, GLuint> texCopiedFrom;  // texture -> texture last glCopyImageSubData'd into it
     std::unordered_map<uint64_t, size_t> layoutPos;    // group key -> place in the last frame's composed picture
     size_t layoutCount = 0;                            // places in it (0 = far)
@@ -261,6 +274,10 @@ std::unordered_map<HGLRC, Ctx*> g_ctx;
 thread_local Ctx* t_ctx;
 thread_local GLenum t_drawMode = 0x0004;   // primitive mode of the draw being issued
 thread_local GLsizei t_drawCount = -1;     // its vertex/index count (-1 = unknown)
+thread_local bool t_drawArrays = false;    // it is glDrawArrays / glDrawElements (vertices the wrapper can read)
+thread_local GLint t_drawFirst = 0;        // glDrawArrays' first vertex
+thread_local GLenum t_drawIndexType = 0;   // glDrawElements' index type (0 = glDrawArrays) and indices
+thread_local const void* t_drawIndices = nullptr;
 thread_local bool t_ownShaders;            // the SR runtime is creating its shaders: leave them alone
 extern bool g_traceNow;
 extern unsigned g_traceDraw;
@@ -741,6 +758,150 @@ float OrderT(size_t k, size_t n)
     return 1.0f - (g_cfg.flatOrderCurve == 1.0f ? x : std::pow(x, std::max(0.05f, g_cfg.flatOrderCurve)));
 }
 
+// A fixed-function draw from client-side arrays (Machinarium): its extent on the screen and, when it puts a
+// bitmap onto a shape, the affine map from its texture coordinates to the screen. Adventure games draw
+// pieces of the background again (walk-behinds: Machinarium's tower and ground edge); such a piece maps
+// its texture exactly as the background did. m: x = m0*u + m1*v + m2, y = m3*u + m4*v + m5 (NDC).
+struct FfGeom {
+    float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f};
+    bool mapped = false;
+    GLuint tex = 0;
+    float m[6] = {};
+    float u0 = 0, v0 = 0, u1 = 0, v1 = 0;   // texture rectangle the draw uses
+    float tol = 0;                           // 3 pixels in NDC
+};
+
+static bool FfGeometry(Ctx* c, int n, FfGeom& g)
+{
+    if (!t_drawArrays || n < 3 || n > 4096 || !c->compat || !R.GetPointerv || !R.IsEnabled(GL_VERTEX_ARRAY)) return false;
+    GLint vs = 0, vt = 0, vst = 0, vb = 1, eb = 0;
+    R.GetIntegerv(GL_VERTEX_ARRAY_SIZE, &vs);
+    R.GetIntegerv(GL_VERTEX_ARRAY_TYPE, &vt);
+    R.GetIntegerv(GL_VERTEX_ARRAY_STRIDE, &vst);
+    R.GetIntegerv(GL_VERTEX_ARRAY_BUFFER_BINDING, &vb);
+    if (t_drawIndexType) R.GetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &eb);
+    if (vs < 2 || vt != GL_FLOAT || vb || eb) return false;
+    if (t_drawIndexType && (!t_drawIndices || (t_drawIndexType != GL_UNSIGNED_BYTE && t_drawIndexType != GL_UNSIGNED_SHORT &&
+                                               t_drawIndexType != GL_UNSIGNED_INT)))
+        return false;
+    void* vp = nullptr;
+    R.GetPointerv(GL_VERTEX_ARRAY_POINTER, &vp);
+    if (!vp) return false;
+    const size_t vstride = vst ? (size_t)vst : (size_t)vs * 4;
+    GLfloat mv[16], pr[16];
+    GLint view[4] = {};
+    R.GetFloatv(GL_MODELVIEW_MATRIX, mv);
+    R.GetFloatv(GL_PROJECTION_MATRIX, pr);
+    R.GetIntegerv(GL_VIEWPORT, view);
+    g.tol = view[2] > 0 ? 6.0f / (float)view[2] : 0.002f;
+    auto vertex = [&](int i) -> size_t {
+        if (!t_drawIndexType) return (size_t)(t_drawFirst + i);
+        if (t_drawIndexType == GL_UNSIGNED_BYTE) return ((const uint8_t*)t_drawIndices)[i];
+        if (t_drawIndexType == GL_UNSIGNED_SHORT) return ((const uint16_t*)t_drawIndices)[i];
+        return ((const uint32_t*)t_drawIndices)[i];
+    };
+    std::vector<float> X(n), Y(n);
+    for (int i = 0; i < n; ++i) {
+        const float* p = (const float*)((const char*)vp + vertex(i) * vstride);
+        const float in[4] = {p[0], p[1], vs > 2 ? p[2] : 0.0f, vs > 3 ? p[3] : 1.0f};
+        float e[4], cl[4];
+        for (int r = 0; r < 4; ++r) e[r] = mv[r] * in[0] + mv[4 + r] * in[1] + mv[8 + r] * in[2] + mv[12 + r] * in[3];
+        for (int r = 0; r < 4; ++r) cl[r] = pr[r] * e[0] + pr[4 + r] * e[1] + pr[8 + r] * e[2] + pr[12 + r] * e[3];
+        if (cl[3] == 0.0f) return false;
+        X[i] = cl[0] / cl[3];
+        Y[i] = cl[1] / cl[3];
+        g.lo[0] = std::min(g.lo[0], X[i]);
+        g.hi[0] = std::max(g.hi[0], X[i]);
+        g.lo[1] = std::min(g.lo[1], Y[i]);
+        g.hi[1] = std::max(g.hi[1], Y[i]);
+    }
+    // the texture map, from three vertices whose texture coordinates span a triangle
+    GLint client = 0, ts = 0, tt = 0, tst = 0, tb = 1;
+    if (!(SampledUnits(c) & 1u) || !(g.tex = c->bound[0][kSlot2D]) || !R.IsEnabled(GL_TEXTURE_COORD_ARRAY)) return true;
+    R.GetIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &client);
+    R.GetIntegerv(GL_TEXTURE_COORD_ARRAY_SIZE, &ts);
+    R.GetIntegerv(GL_TEXTURE_COORD_ARRAY_TYPE, &tt);
+    R.GetIntegerv(GL_TEXTURE_COORD_ARRAY_STRIDE, &tst);
+    R.GetIntegerv(GL_TEXTURE_COORD_ARRAY_BUFFER_BINDING, &tb);
+    void* tp = nullptr;
+    R.GetPointerv(GL_TEXTURE_COORD_ARRAY_POINTER, &tp);
+    if (client != (GLint)GL_TEXTURE0 || ts < 2 || tt != GL_FLOAT || tb || !tp) return true;
+    const size_t tstride = tst ? (size_t)tst : (size_t)ts * 4;
+    auto tc = [&](int i) { return (const float*)((const char*)tp + vertex(i) * tstride); };
+    int i1 = -1, i2 = -1;
+    const float* a = tc(0);
+    for (int i = 1; i < n && i2 < 0; ++i) {
+        const float* b = tc(i);
+        if (i1 < 0) {
+            if (fabsf(b[0] - a[0]) + fabsf(b[1] - a[1]) > 1e-6f) i1 = i;
+            continue;
+        }
+        const float* m1 = tc(i1);
+        if (fabsf((m1[0] - a[0]) * (b[1] - a[1]) - (b[0] - a[0]) * (m1[1] - a[1])) > 1e-9f) i2 = i;
+    }
+    if (i2 < 0) return true;
+    const int idx[3] = {0, i1, i2};
+    float U[3], V[3], PX[3], PY[3];
+    for (int j = 0; j < 3; ++j) {
+        U[j] = tc(idx[j])[0];
+        V[j] = tc(idx[j])[1];
+        PX[j] = X[idx[j]];
+        PY[j] = Y[idx[j]];
+    }
+    const float det = U[0] * (V[1] - V[2]) - V[0] * (U[1] - U[2]) + (U[1] * V[2] - U[2] * V[1]);
+    if (fabsf(det) < 1e-12f) return true;
+    auto solve = [&](const float* r, float* out) {   // Cramer's rule: [u v 1] . out = r
+        out[0] = (r[0] * (V[1] - V[2]) - V[0] * (r[1] - r[2]) + (r[1] * V[2] - r[2] * V[1])) / det;
+        out[1] = (U[0] * (r[1] - r[2]) - r[0] * (U[1] - U[2]) + (U[1] * r[2] - U[2] * r[1])) / det;
+        out[2] = (U[0] * (V[1] * r[2] - V[2] * r[1]) - V[0] * (U[1] * r[2] - U[2] * r[1]) + r[0] * (U[1] * V[2] - U[2] * V[1])) / det;
+    };
+    solve(PX, g.m);
+    solve(PY, g.m + 3);
+    g.u0 = g.v0 = 1e30f;
+    g.u1 = g.v1 = -1e30f;
+    for (int i = 0; i < n; ++i) {
+        const float* t = tc(i);
+        if (fabsf(g.m[0] * t[0] + g.m[1] * t[1] + g.m[2] - X[i]) > g.tol || fabsf(g.m[3] * t[0] + g.m[4] * t[1] + g.m[5] - Y[i]) > g.tol)
+            return true;   // not one bitmap placement
+        g.u0 = std::min(g.u0, t[0]);
+        g.u1 = std::max(g.u1, t[0]);
+        g.v0 = std::min(g.v0, t[1]);
+        g.v1 = std::max(g.v1, t[1]);
+    }
+    g.mapped = true;
+    return true;
+}
+
+// The layer of a picture drawn earlier this frame into the same target that this draw repeats a piece of
+// (same texture, both maps agree over this draw's texture rectangle), or 0. A piece that covers anything
+// drawn over that picture since (a character behind a walk-behind) stays a layer of its own in front.
+// matched: it repeats a piece of a picture at all (then it is no new picture itself).
+static uint64_t FfContinues(Ctx* c, const FfGeom& g, bool& matched)
+{
+    matched = false;
+    for (const Ctx::Picture& p : c->pictures) {
+        if (p.fb != c->drawFb || p.tex != g.tex) continue;
+        bool same = true;
+        const float cu[4] = {g.u0, g.u1, g.u0, g.u1}, cv[4] = {g.v0, g.v0, g.v1, g.v1};
+        for (int k = 0; k < 4 && same; ++k)
+            for (int r = 0; r < 2; ++r) {
+                const float* m = g.m + 3 * r;
+                const float* q = p.m + 3 * r;
+                same &= fabsf((m[0] - q[0]) * cu[k] + (m[1] - q[1]) * cv[k] + (m[2] - q[2])) <= g.tol;
+            }
+        if (!same) continue;
+        matched = true;
+        for (size_t b = p.box + 1; b < c->ffBoxes.size(); ++b) {
+            const Ctx::FfBox& o = c->ffBoxes[b];
+            if (o.fb == p.fb && o.key != p.key && o.lo[0] < g.hi[0] - g.tol && g.lo[0] < o.hi[0] - g.tol &&
+                o.lo[1] < g.hi[1] - g.tol && g.lo[1] < o.hi[1] - g.tol)
+                return 0;
+        }
+        return p.key;
+    }
+    return 0;
+}
+
 void OrderDepthForDraw(Ctx* c)
 {
     FlatEv ev;
@@ -804,7 +965,18 @@ void OrderDepthForDraw(Ctx* c)
     // fixed-function and ARB draws have no GLSL program; the salt keeps an untextured one's key from being 0 (no layer)
     const uint64_t prog = c->program ? c->program : c->arbActive ? 0x80000000u | c->arbVp : 0;
     const uint64_t id = ((prog << 32) ^ texKey) ^ 0x5BD1E995ull;
-    if (id != c->groupId || c->frameGroups == 0 || g_cfg.flatGroupByDraw) {
+    // fixed function: a piece of a picture drawn before in this frame (a walk-behind) joins its layer, or
+    // it stands out of the background as a rectangle
+    FfGeom fg;
+    const bool geom = !c->program && !c->arbActive && FfGeometry(c, ev.count, fg);
+    bool repeat = false;
+    const uint64_t cont = geom && fg.mapped ? FfContinues(c, fg, repeat) : 0;
+    if (cont) {
+        static int logged;
+        if (logged++ < 3) Log("flat depth: a draw repeats part of an earlier picture (texture %u, same placement): same layer", fg.tex);
+        c->groupKey = cont;
+        c->groupId = 0;   // the draw after it starts a group of its own
+    } else if (id != c->groupId || c->frameGroups == 0 || g_cfg.flatGroupByDraw) {
         c->groupId = id;
         int seen = 0;
         for (uint64_t g : c->groupIds) seen += g == id;
@@ -814,6 +986,14 @@ void OrderDepthForDraw(Ctx* c)
     }
     ev.key = c->groupKey;
     c->flatEvents.push_back(ev);
+    if (geom && c->ffBoxes.size() < 4096) {
+        if (fg.mapped && !repeat) {
+            Ctx::Picture pic{c->drawFb, fg.tex, {}, c->groupKey, c->ffBoxes.size()};
+            memcpy(pic.m, fg.m, sizeof(pic.m));
+            c->pictures.push_back(pic);
+        }
+        c->ffBoxes.push_back({c->drawFb, {fg.lo[0], fg.lo[1]}, {fg.hi[0], fg.hi[1]}, c->groupKey});
+    }
     size_t g = c->frameGroups - 1;
     size_t n = std::max(c->lastGroupCount, c->frameGroups);
     auto lt = c->layoutPos.find(c->groupKey);   // its place in the composed picture, when known
@@ -843,8 +1023,8 @@ void OrderDepthForDraw(Ctx* c)
     c->groupKeyFrame = g_frame;
     c->groupKeyLast = c->groupKey;
     c->orderDepth = it->second.depth;
-    if (g_traceNow) Log("T %u.%u order group %zu/%zu prog %u tex %u target %.3f depth %.3f slot %.3f prims %.0f", g_frame, g_traceDraw, g, n,
-                        c->program, ev.tex, t, c->orderDepth, c->orderSlot, c->drawPrims);
+    if (g_traceNow) Log("T %u.%u order group %zu/%zu prog %u tex %u target %.3f depth %.3f slot %.3f prims %.0f%s", g_frame, g_traceDraw, g, n,
+                        c->program, ev.tex, t, c->orderDepth, c->orderSlot, c->drawPrims, cont ? " (repeats an earlier picture)" : "");
 }
 
 // Painter's order of the composed picture: walks the framebuffer drawn last; a composite pass stands
@@ -870,6 +1050,8 @@ static void WalkLayout(const std::vector<FlatEv>& ev, const std::unordered_map<u
 void ComputeLayout(Ctx* c)
 {
     std::vector<FlatEv>& ev = c->flatEvents;
+    c->pictures.clear();
+    c->ffBoxes.clear();
     c->layoutPos.clear();
     c->layoutCount = 0;
     if (ev.empty()) return;
@@ -4316,14 +4498,22 @@ extern "C" {
 
 void WINAPI H_glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
+    t_drawArrays = true;
+    t_drawFirst = first;
+    t_drawIndexType = 0;
     TraceDraw("DrawArrays", mode, count);
     StereoDraw([&] { R.DrawArrays(mode, first, count); });
+    t_drawArrays = false;
 }
 
 void WINAPI H_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices)
 {
+    t_drawArrays = true;
+    t_drawIndexType = type;
+    t_drawIndices = indices;
     TraceDraw("DrawElements", mode, count);
     StereoDraw([&] { R.DrawElements(mode, count, type, indices); });
+    t_drawArrays = false;
 }
 
 // A scissor or viewport call after some draws starts a new batch (AGS: room, then UI overlays) -

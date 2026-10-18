@@ -83,6 +83,8 @@ enum : GLenum {
     GL_NEAREST = 0x2600,
     GL_LINEAR = 0x2601,
     GL_UNSIGNED_BYTE = 0x1401,
+    GL_UNSIGNED_SHORT = 0x1403,
+    GL_UNSIGNED_INT = 0x1405,
     GL_FLOAT = 0x1406,
     GL_RGBA = 0x1908,
     GL_BGRA = 0x80E1,
@@ -194,6 +196,21 @@ enum : GLenum {
     GL_ATTACHED_SHADERS = 0x8B85,
     GL_TRIANGLES = 0x0004,
     GL_TRIANGLE_FAN = 0x0006,
+    // fixed-function client arrays (flat depth reads a draw's vertices)
+    GL_MODELVIEW_MATRIX = 0x0BA6,
+    GL_VERTEX_ARRAY = 0x8074,
+    GL_TEXTURE_COORD_ARRAY = 0x8078,
+    GL_VERTEX_ARRAY_SIZE = 0x807A,
+    GL_VERTEX_ARRAY_TYPE = 0x807B,
+    GL_VERTEX_ARRAY_STRIDE = 0x807C,
+    GL_TEXTURE_COORD_ARRAY_SIZE = 0x8088,
+    GL_TEXTURE_COORD_ARRAY_TYPE = 0x8089,
+    GL_TEXTURE_COORD_ARRAY_STRIDE = 0x808A,
+    GL_VERTEX_ARRAY_POINTER = 0x808E,
+    GL_TEXTURE_COORD_ARRAY_POINTER = 0x8092,
+    GL_CLIENT_ACTIVE_TEXTURE = 0x84E1,
+    GL_VERTEX_ARRAY_BUFFER_BINDING = 0x8896,
+    GL_TEXTURE_COORD_ARRAY_BUFFER_BINDING = 0x889A,
 };
 
 constexpr GLuint64 GL_TIMEOUT_IGNORED = 0xFFFFFFFFFFFFFFFFull;
@@ -227,6 +244,7 @@ constexpr int kMaxUnits = 32;
     X(void, DrawBuffer, (GLenum mode))                                                               \
     X(void, ReadBuffer, (GLenum mode))                                                               \
     X(void, GetIntegerv, (GLenum pname, GLint* data))                                                \
+    X(void, GetPointerv, (GLenum pname, void** params))                                              \
     X(void, GetBooleanv, (GLenum pname, GLboolean* data))                                            \
     X(void, GetFloatv, (GLenum pname, GLfloat* data))                                                \
     X(GLboolean, IsEnabled, (GLenum cap))                                                            \
