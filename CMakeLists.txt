@@ -39,6 +39,7 @@ add_library(OGL3D SHARED
     src/srout.cpp
     src/osd.cpp
     src/present.cpp
+    src/cghook.cpp
     ${OGL3D_FORWARD}
     src/gen/opengl32_${OGL3D_ARCH}.def
     "${CMAKE_CURRENT_BINARY_DIR}/version.rc")

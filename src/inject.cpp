@@ -68,6 +68,54 @@ bool InjectVertexShader(const std::string& src, std::string& out)
     return true;
 }
 
+// ARB assembly vertex programs (!!ARBvp1.0, also NV's !!NVvp4.0/5.0; Cg's arbvp1 profile, PSSG games
+// such as Rocketbirds): the program writes its position into a temporary instead of result.position,
+// and a tail offsets x per eye from program.env[envIndex] before writing result.position:
+//   x = eye * separation, y = convergence, z = offset per w for flat (w == 1) geometry
+// Perspective geometry moves by x * (w - y) like the GLSL rewrite; flat geometry by z * w (the host
+// puts the draw's flat depth there, or 0 to keep it at the screen).
+bool InjectArbVertexProgram(const std::string& src, int envIndex, std::string& out)
+{
+    if (src.compare(0, 10, "!!ARBvp1.0") != 0 && src.compare(0, 6, "!!NVvp") != 0) return false;
+    if (src.find("s3d_pos") != std::string::npos) return false;   // already ours
+    // position computed by the fixed-function pipeline: result.position must not be written
+    if (std::regex_search(src, std::regex(R"(OPTION\s+ARB_position_invariant)"))) return false;
+    if (src.find("result.position") == std::string::npos) return false;
+    // declarations go after the header line and the OPTION lines (they have to come first)
+    size_t at = src.find('\n');
+    if (at == std::string::npos) return false;
+    ++at;
+    static const std::regex optionRe(R"(^\s*(OPTION\b[^;]*;|#[^\n]*)?\s*$)");
+    while (at < src.size()) {
+        size_t eol = src.find('\n', at);
+        std::string line = src.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+        if (!std::regex_match(line, optionRe)) break;
+        at = eol == std::string::npos ? src.size() : eol + 1;
+    }
+    size_t end = src.rfind("END");
+    if (end == std::string::npos || end < at) return false;
+    std::string body = src.substr(at, end - at);
+    // OUTPUT oPos = result.position;  ->  ALIAS oPos = s3d_pos;
+    body = std::regex_replace(body, std::regex(R"(OUTPUT\s+(\w+)\s*=\s*result\.position\s*;)"), "ALIAS $1 = s3d_pos;");
+    body = std::regex_replace(body, std::regex(R"(result\.position\b)"), "s3d_pos");
+    const std::string env = "program.env[" + std::to_string(envIndex) + "]";
+    out = src.substr(0, at) +
+          "PARAM s3d_E = " + env + ";\nPARAM s3d_c = { 1, 0.00001, 0, 0 };\nTEMP s3d_pos, s3d_t;\n" + body +
+          "# --- OGL3D stereo ---\n"
+          "ADD s3d_t.x, s3d_pos.w, -s3d_E.y;\n"      // w - convergence
+          "MUL s3d_t.x, s3d_t.x, s3d_E.x;\n"         // perspective offset
+          "MUL s3d_t.y, s3d_pos.w, s3d_E.z;\n"       // flat offset
+          "ADD s3d_t.z, s3d_pos.w, -s3d_c.x;\n"
+          "ABS s3d_t.z, s3d_t.z;\n"
+          "SLT s3d_t.z, s3d_t.z, s3d_c.y;\n"         // 1 when w == 1 (flat geometry)
+          "ADD s3d_t.y, s3d_t.y, -s3d_t.x;\n"
+          "MAD s3d_t.x, s3d_t.z, s3d_t.y, s3d_t.x;\n"
+          "ADD s3d_pos.x, s3d_pos.x, s3d_t.x;\n"
+          "MOV result.position, s3d_pos;\n" +
+          src.substr(end);
+    return true;
+}
+
 // Silhouette depth ([Flat] silhouette): a picture drawn as one image (FRAMED's comic panels are
 // videos) gets a second depth inside it. The fragment shader samples the picture through a
 // coordinate shifted per eye wherever the shifted or the unshifted pixel is dark, so dark figures

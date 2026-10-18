@@ -175,6 +175,8 @@ void LoadConfig()
     c.silThreshold = IniFloat(L"Flat", L"silhouette_threshold", c.silThreshold);
     c.inject =IniInt(L"Inject", L"enable", c.inject) != 0;
     c.blockProgramBinary = IniInt(L"Inject", L"block_program_binary", c.blockProgramBinary) != 0;
+    c.cgGlsl = IniInt(L"Inject", L"cg_glsl", c.cgGlsl);
+    c.arbPrograms = IniInt(L"Inject", L"arb_programs", c.arbPrograms) != 0;
     c.dumpShaders = IniInt(L"Inject", L"dump_shaders", c.dumpShaders) != 0;
     c.minTargetWidth = IniInt(L"Targets", L"min_width", c.minTargetWidth);
     c.aspectTolerance = IniFloat(L"Targets", L"aspect_tolerance", c.aspectTolerance);

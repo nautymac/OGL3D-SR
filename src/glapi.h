@@ -360,6 +360,11 @@ constexpr int kMaxUnits = 32;
                                GLenum* type, GLchar* name))                                          \
     X(void, GetUniformfv, (GLuint prog, GLint loc, GLfloat* params))                                     X(void, GetUniformiv, (GLuint prog, GLint loc, GLint* params))                                   \
     X(void, DetachShader, (GLuint prog, GLuint sh))                                                  \
+    X(void, ProgramStringARB, (GLenum target, GLenum format, GLsizei len, const void* str))          \
+    X(void, BindProgramARB, (GLenum target, GLuint prog))                                            \
+    X(void, DeleteProgramsARB, (GLsizei n, const GLuint* progs))                                     \
+    X(void, ProgramEnvParameter4fARB, (GLenum target, GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w))\
+    X(void, GetProgramivARB, (GLenum target, GLenum pname, GLint* params))                           \
     X(void, ClipControl, (GLenum origin, GLenum depth))                                              \
     X(void, TextureView, (GLuint tex, GLenum target, GLuint orig, GLenum ifmt, GLuint minLevel,      \
                           GLuint numLevels, GLuint minLayer, GLuint numLayers))                                                  \

@@ -54,6 +54,8 @@ struct Config {
     bool inject = true;
     bool blockProgramBinary = true;
     bool dumpShaders = false;
+    int cgGlsl = 0;               // NVIDIA Cg games: make cgGLGetLatestProfile answer GLSL (1); off by default (Rocketbirds turned white)
+    bool arbPrograms = true;      // rewrite ARB/NV assembly vertex programs (Cg arbvp1) for the stereo offset
     // [Targets]
     int minTargetWidth = 64;
     float aspectTolerance = 0.03f;
@@ -110,6 +112,9 @@ void OnMakeCurrent(HDC dc, HGLRC rc);
 void OnDeleteContext(HGLRC rc);
 bool OnSwapBuffers(HDC dc);       // true: the frame was presented in our window, skip the game's swap
 
+// cghook.cpp
+void InstallCgGlslHooks();        // [Inject] cg_glsl: Cg programs compile to GLSL
+
 // present.cpp (upscale mode)
 void InstallDisplayModeHooks();
 bool PresentFrame(HWND game, GLuint sbsFbo, int eyeW, int eyeH, bool weave);
@@ -129,6 +134,7 @@ void OsdRender(GLuint fbo, int vx, int vy, int vw, int vh, int W, int H, bool co
 
 // inject.cpp
 bool InjectVertexShader(const std::string& src, std::string& out);
+bool InjectArbVertexProgram(const std::string& src, int envIndex, std::string& out);
 bool InjectSilhouette(const std::string& src, const std::string& uv, const std::string& tex, std::string& out,
                       std::string& why);
 struct VsOutput {

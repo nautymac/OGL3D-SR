@@ -157,6 +157,10 @@ struct Ctx {
     int maxUnit = 0;
     GLuint bound[kMaxUnits][kSlotCount] = {};
     GLenum listMode = 0;      // the game's glNewList mode while it compiles a list
+    GLuint arbVp = 0;         // bound ARB vertex program
+    GLuint arbFp = 0;         // bound ARB fragment program
+    bool arbActive = false;   // the draw being issued runs one of our rewritten ARB vertex programs
+    GLint arbEnv = -1;        // program.env index the rewrite reads
     // scissor/viewport batches of the current frame (flat depth: later batches are UI)
     int batch = 0;
     unsigned drawsInBatch = 0;
@@ -274,6 +278,26 @@ std::unordered_map<GLuint, std::string> g_vsPlain; // ... and their injected sou
 // contexts and makes an unshared one, where the same names belong to other objects.
 std::map<std::pair<HGLRC, std::string>, GLuint> g_flatGs;
 std::unordered_set<GLuint> g_vsBad;                // vertex shaders flat depth could not analyse
+std::unordered_set<GLuint> g_arbVp;                // ARB vertex programs holding our stereo tail
+std::unordered_map<GLuint, uint32_t> g_arbFpUnits; // ARB fragment program -> texture units it reads
+#ifndef GL_VERTEX_PROGRAM_ARB
+#define GL_VERTEX_PROGRAM_ARB 0x8620
+#endif
+#ifndef GL_FRAGMENT_PROGRAM_ARB
+#define GL_FRAGMENT_PROGRAM_ARB 0x8804
+#endif
+#ifndef GL_PROGRAM_FORMAT_ASCII_ARB
+#define GL_PROGRAM_FORMAT_ASCII_ARB 0x8875
+#endif
+#ifndef GL_PROGRAM_ERROR_POSITION_ARB
+#define GL_PROGRAM_ERROR_POSITION_ARB 0x864B
+#endif
+#ifndef GL_PROGRAM_ERROR_STRING_ARB
+#define GL_PROGRAM_ERROR_STRING_ARB 0x8874
+#endif
+#ifndef GL_MAX_PROGRAM_ENV_PARAMETERS_ARB
+#define GL_MAX_PROGRAM_ENV_PARAMETERS_ARB 0x88B5
+#endif
 
 // Outputs of several vertex shader pieces of one program, each name once.
 void MergeVsInfo(VsInfo& into, const VsInfo& add)
@@ -554,8 +578,13 @@ GLuint RightFor(Ctx* c, GLuint fb)
     for (int i = 0; i < kAttCount && !sized; ++i)
         if (f.att[i].kind) sized = AttSize(c, f.att[i], w, h);
     bool stereo = sized && (IsStereoSize(c, w, h) || f.promoted);
-    if (stereo != f.stereo || w != f.w || h != f.h)
-        Log("fbo %u: %dx%d -> %s", fb, w, h, stereo ? (f.promoted ? "stereo (a layer cache drawn into the stereo scene)" : "stereo") : "mono");
+    if (stereo != f.stereo || w != f.w || h != f.h) {
+        // games that re-attach one framebuffer to other textures all the time (Rocketbirds) would fill the log
+        static unsigned changes;
+        if (++changes <= 300 || changes % 5000 == 0)
+            Log("fbo %u: %dx%d -> %s%s", fb, w, h, stereo ? (f.promoted ? "stereo (a layer cache drawn into the stereo scene)" : "stereo") : "mono",
+                changes == 300 ? " (further framebuffer changes are logged every 5000th)" : "");
+    }
     f.stereo = stereo;
     f.w = w;
     f.h = h;
@@ -665,6 +694,10 @@ int FbosOfTexture(Ctx* c, GLuint tex, GLuint* out, int max)
 // ordinary sprites look like composite passes (no depth) in Huntdown.
 uint32_t SampledUnits(Ctx* c)
 {
+    if (!c->program && c->arbFp && R.IsEnabled(GL_FRAGMENT_PROGRAM_ARB)) {   // ARB fragment program: its texture[n]
+        auto it = g_arbFpUnits.find(c->arbFp);
+        if (it != g_arbFpUnits.end()) return it->second;
+    }
     ProgInfo* pi = c->program ? FindProg(c->program) : nullptr;
     if (!pi || !pi->samplersKnown || !R.GetUniformiv) return ~0u;
     if (!pi->unitsRead) {
@@ -1028,6 +1061,22 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
         }
         return;
     }
+    if (c->arbActive) {
+        // rewritten ARB vertex program: x = eye * separation, y = convergence, z = offset per w for flat
+        // (w == 1) geometry - its order-rule depth (no per-sprite spread without a geometry shader)
+        const float a = eye * SepValue();
+        float flat = 0.0f;
+        if (eye != 0.0f) {
+            if (g_cfg.flatEnable && g_cfg.flatRule == 1) {
+                const bool screen = (g_cfg.flatScreenBatch > 0 && c->batch >= g_cfg.flatScreenBatch) || SamplesStereoTarget(c);
+                if (!screen) flat = a * ((c->orderDepth + c->orderSlot * 0.4f) * g_cfg.flatTop - g_cfg.flatZero);
+            } else if (!g_cfg.monoW1) {
+                flat = a * (1.0f - g_cfg.convergence);
+            }
+        }
+        R.ProgramEnvParameter4fARB(GL_VERTEX_PROGRAM_ARB, (GLuint)c->arbEnv, a, g_cfg.convergence, flat, 0.0f);
+        return;
+    }
     // Fixed function, ARB programs and GLSL using the built-in matrices: offset the projection.
     if (eye == 0.0f || !c->compat || !g_cfg.fixedFunction) return;
     GLfloat p[16];
@@ -1112,7 +1161,9 @@ void StereoDraw(F&& draw)
         c->batchFb = c->drawFb;
         c->drawsInBatch++;
     }
-    if (pi && pi->gs && g_cfg.flatRule == 1 && c->isMain) OrderDepthForDraw(c);
+    // an ARB assembly vertex program we rewrote (no GLSL program bound)
+    c->arbActive = !c->program && c->arbVp && g_arbVp.count(c->arbVp) && R.IsEnabled(GL_VERTEX_PROGRAM_ARB);
+    if (((pi && pi->gs) || (c->arbActive && g_cfg.flatEnable)) && g_cfg.flatRule == 1 && c->isMain) OrderDepthForDraw(c);
     if (pi && pi->gs && t_drawMode != GL_TRIANGLES && t_drawMode != GL_TRIANGLE_STRIP && t_drawMode != GL_TRIANGLE_FAN) {
         // a geometry shader only takes triangles; points/lines would fail (TODO: GS-less twin program)
         static int logged;
@@ -1274,7 +1325,7 @@ void TraceDraw(const char* fn, GLenum mode, GLsizei count)
     }
     Log("T %u.%u b%d %s mode=%x n=%d prog=%u/%08x%s%s fb=%u%s(t%u) vp=%d,%d,%d,%d%s sc=%d,%d,%d,%d blend=%d tex=%u(%dx%d)%s", g_frame,
         g_traceDraw++, c->batch, fn, mode, count, c->program, pi ? pi->hash : 0, pi && pi->loc < 0 ? "(noinj)" : "",
-        pi && pi->gs ? "(gs)" : "", c->drawFb,
+        pi && pi->gs ? "(gs)" : c->arbActive ? "(arbvp)" : "", c->drawFb,
         c->drawFb == 0 || (fi && fi->stereo) ? "S" : "", fi ? fi->att[0].id : 0, vp[0], vp[1], vp[2], vp[3], scissor ? "" : "(off)", sc[0], sc[1],
         sc[2], sc[3], blend, tex, ti ? ti->w : 0, ti ? ti->h : 0, mat);
     if (!sampled.empty() || units != ~0u) Log("T %u.%u   samples%s%s", g_frame, g_traceDraw - 1, sampled.c_str(), units == ~0u ? " (all units)" : "");
@@ -3558,6 +3609,79 @@ void GLAPIENTRY H_LinkProgram(GLuint prog)
             pi.mode != kModeStereo ? ModeName(pi.mode) : L"", ms);
 }
 
+// ---- ARB assembly vertex programs (Cg arbvp1: PSSG games) ---------------------------------------
+void GLAPIENTRY H_BindProgramARB(GLenum target, GLuint prog)
+{
+    R.BindProgramARB(target, prog);
+    if (Ctx* c = t_ctx) {
+        if (target == GL_VERTEX_PROGRAM_ARB) c->arbVp = prog;
+        else if (target == GL_FRAGMENT_PROGRAM_ARB) c->arbFp = prog;
+    }
+}
+
+void GLAPIENTRY H_DeleteProgramsARB(GLsizei n, const GLuint* progs)
+{
+    R.DeleteProgramsARB(n, progs);
+    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    for (GLsizei i = 0; progs && i < n; ++i) {
+        g_arbVp.erase(progs[i]);
+        g_arbFpUnits.erase(progs[i]);
+    }
+}
+
+void GLAPIENTRY H_ProgramStringARB(GLenum target, GLenum format, GLsizei len, const void* str)
+{
+    Ctx* c = t_ctx;
+    if (c && target == GL_FRAGMENT_PROGRAM_ARB && format == GL_PROGRAM_FORMAT_ASCII_ARB && str && len > 0) {
+        // the texture units it reads ("texture[n]"), for SampledUnits: other units may hold stale render targets
+        const std::string src((const char*)str, (size_t)len);
+        uint32_t m = 0;
+        for (size_t at = src.find("texture["); at != std::string::npos; at = src.find("texture[", at + 8)) {
+            const int u = atoi(src.c_str() + at + 8);
+            if (u >= 0 && u < 32) m |= 1u << u;
+        }
+        std::lock_guard<std::recursive_mutex> lk(g_lock);
+        g_arbFpUnits[c->arbFp] = m;
+    }
+    if (!c || !g_cfg.arbPrograms || target != GL_VERTEX_PROGRAM_ARB || format != GL_PROGRAM_FORMAT_ASCII_ARB || !str || len <= 0 ||
+        !R.GetProgramivARB || !R.ProgramEnvParameter4fARB) {
+        R.ProgramStringARB(target, format, len, str);
+        return;
+    }
+    if (c->arbEnv < 0) {   // the last env parameter: engines use local parameters (Cg) or the first ones
+        GLint n = 0;
+        R.GetProgramivARB(GL_VERTEX_PROGRAM_ARB, GL_MAX_PROGRAM_ENV_PARAMETERS_ARB, &n);
+        c->arbEnv = n > 0 ? n - 1 : 95;
+    }
+    const std::string src((const char*)str, (size_t)len);
+    std::string out;
+    if (!InjectArbVertexProgram(src, c->arbEnv, out)) {
+        R.ProgramStringARB(target, format, len, str);
+        std::lock_guard<std::recursive_mutex> lk(g_lock);
+        g_arbVp.erase(c->arbVp);
+        return;
+    }
+    R.ProgramStringARB(target, format, (GLsizei)out.size(), out.c_str());
+    GLint pos = -1;
+    R.GetIntegerv(GL_PROGRAM_ERROR_POSITION_ARB, &pos);
+    if (pos != -1) {
+        // the rewrite did not assemble: log why, load the original and clear the error it left
+        const char* err = (const char*)R.GetString(GL_PROGRAM_ERROR_STRING_ARB);
+        static int logged;
+        if (logged++ < 3) Log("ARB vertex program %u: stereo rewrite failed at %d (%s), using the original:\n%s", c->arbVp, pos, err ? err : "", out.c_str());
+        static auto getError = (GLenum(WINAPI*)())GetProcAddress(RealOpenGL(), "glGetError");
+        if (getError) while (getError() != 0) {}
+        R.ProgramStringARB(target, format, len, str);
+        std::lock_guard<std::recursive_mutex> lk(g_lock);
+        g_arbVp.erase(c->arbVp);
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    g_arbVp.insert(c->arbVp);
+    static unsigned count;
+    if (++count <= 3) Log("ARB vertex program %u rewritten for stereo (env[%d], %zu -> %zu bytes)", c->arbVp, c->arbEnv, src.size(), out.size());
+}
+
 void GLAPIENTRY H_UseProgram(GLuint prog)
 {
     R.UseProgram(prog);
@@ -3795,6 +3919,9 @@ const HookEntry kHooks[] = {
     HOOK("glDeleteProgram", H_DeleteProgram, DeleteProgram),
     HOOK("glDeleteObjectARB", H_DeleteObjectARB, DeleteObjectARB),
     HOOK("glProgramBinary", H_ProgramBinary, ProgramBinary),
+    HOOK("glProgramStringARB", H_ProgramStringARB, ProgramStringARB),
+    HOOK("glBindProgramARB", H_BindProgramARB, BindProgramARB),
+    HOOK("glDeleteProgramsARB", H_DeleteProgramsARB, DeleteProgramsARB),
     HOOK("glDrawArraysInstanced", H_DrawArraysInstanced, DrawArraysInstanced),
     HOOK("glDrawArraysInstancedARB", H_DrawArraysInstanced, DrawArraysInstanced),
     HOOK("glDrawArraysInstancedEXT", H_DrawArraysInstanced, DrawArraysInstanced),
@@ -3901,6 +4028,12 @@ void OnMakeCurrent(HDC dc, HGLRC rc)
     if (!rc) {
         t_ctx = nullptr;
         return;
+    }
+    // Cg games ask for their profiles once a context is current: redirect that before they can
+    static bool cgHooked;
+    if (!cgHooked && (g_cfg.cgGlsl > 0 || (g_cfg.cgGlsl < 0 && g_cfg.flatEnable))) {
+        cgHooked = true;
+        InstallCgGlslHooks();
     }
     std::lock_guard<std::recursive_mutex> lk(g_lock);
     Ctx*& c = g_ctx[rc];
