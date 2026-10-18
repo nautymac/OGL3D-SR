@@ -192,8 +192,26 @@ struct Ctx {
         float m[6];
         uint64_t key;
         size_t box;                                    // its entry in ffBoxes
+        int kind;                                      // feet rule: its depth (FeetDepthForDraw)
+        float depth;
     };
     std::vector<Picture> pictures;                     // this frame's
+    // feet rule, fixed function (FeetDepthForDraw): the draw being issued is 0 at the screen, 1 at ffDepth,
+    // 2 on the floor slope
+    int ffKind = 0;
+    float ffDepth = 0.0f;
+    int ffSprites = 0;                                 // draws this frame that stand on the floor
+    bool ffRunOn = false;                              // the object being drawn (parts stacked on each other)
+    GLuint ffRunFb = 0;
+    float ffRun[4] = {};                               // its box: lo x, lo y, hi x, hi y (NDC)
+    float ffRunCap = 0.0f;                             // nearest depth of the objects it was drawn over
+    struct FfObj {                                     // objects drawn this frame (their box and depth)
+        GLuint fb;
+        float box[4];
+        float depth;
+    };
+    std::vector<FfObj> ffObjects;
+    std::vector<std::array<float, 4>> ffOverlays;      // later screen-wide pictures (UI): what lies in them stays there
     std::unordered_map<GLuint, GLuint> texCopiedFrom;  // texture -> texture last glCopyImageSubData'd into it
     std::unordered_map<uint64_t, size_t> layoutPos;    // group key -> place in the last frame's composed picture
     size_t layoutCount = 0;                            // places in it (0 = far)
@@ -876,9 +894,8 @@ static bool FfGeometry(Ctx* c, int n, FfGeom& g)
 // (same texture, both maps agree over this draw's texture rectangle), or 0. A piece that covers anything
 // drawn over that picture since (a character behind a walk-behind) stays a layer of its own in front.
 // matched: it repeats a piece of a picture at all (then it is no new picture itself).
-static uint64_t FfContinues(Ctx* c, const FfGeom& g, bool& matched)
+static const Ctx::Picture* FfRepeatOf(Ctx* c, const FfGeom& g)
 {
-    matched = false;
     for (const Ctx::Picture& p : c->pictures) {
         if (p.fb != c->drawFb || p.tex != g.tex) continue;
         bool same = true;
@@ -889,8 +906,17 @@ static uint64_t FfContinues(Ctx* c, const FfGeom& g, bool& matched)
                 const float* q = p.m + 3 * r;
                 same &= fabsf((m[0] - q[0]) * cu[k] + (m[1] - q[1]) * cv[k] + (m[2] - q[2])) <= g.tol;
             }
-        if (!same) continue;
-        matched = true;
+        if (same) return &p;
+    }
+    return nullptr;
+}
+
+static uint64_t FfContinues(Ctx* c, const FfGeom& g, bool& matched)
+{
+    const Ctx::Picture* found = FfRepeatOf(c, g);
+    matched = found != nullptr;
+    if (found) {
+        const Ctx::Picture& p = *found;
         for (size_t b = p.box + 1; b < c->ffBoxes.size(); ++b) {
             const Ctx::FfBox& o = c->ffBoxes[b];
             if (o.fb == p.fb && o.key != p.key && o.lo[0] < g.hi[0] - g.tol && g.lo[0] < o.hi[0] - g.tol &&
@@ -900,6 +926,92 @@ static uint64_t FfContinues(Ctx* c, const FfGeom& g, bool& matched)
         return p.key;
     }
     return 0;
+}
+
+// Feet rule for fixed-function draws (Machinarium; the geometry shader does this for GLSL). The first
+// pictures as wide as the screen are the floor, sloping back with the screen height; a piece of a picture
+// drawn again (walk-behind) keeps that picture's depth; other draws stand at the bottom edge of the object
+// they belong to (parts stacked within each other's width: Machinarium's robot is legs, body and head);
+// a screen-wide picture drawn after those (inventory bar, fade) and what lies in it stay at the screen.
+void FeetDepthForDraw(Ctx* c)
+{
+    c->ffKind = 0;
+    if ((g_cfg.flatScreenBatch > 0 && c->batch >= g_cfg.flatScreenBatch) || SamplesStereoTarget(c)) return;
+    FfGeom g;
+    if (!FfGeometry(c, t_drawCount, g)) return;
+    auto t = [](float y) { return (std::max(-1.0f, std::min(1.0f, y)) + 1.0f) * 0.5f * g_cfg.flatTop - g_cfg.flatZero; };
+    const Ctx::Picture* rep = g.mapped ? FfRepeatOf(c, g) : nullptr;
+    const float w = g.hi[0] - g.lo[0], h = g.hi[1] - g.lo[1];
+    const char* what = "object";
+    if (rep) {
+        c->ffKind = rep->kind;
+        c->ffDepth = rep->depth;
+        c->ffRunOn = false;
+        what = "repeat";
+    } else if (w >= g_cfg.flatPlane && h >= g_cfg.flatPlaneHeight) {
+        if (c->ffSprites == 0) {
+            c->ffKind = 2;
+            what = "floor";
+        } else {
+            c->ffOverlays.push_back({g.lo[0], g.lo[1], g.hi[0], g.hi[1]});
+            what = "overlay";
+        }
+        c->ffRunOn = false;
+    } else {
+        // mostly inside such a picture (an inventory icon; not a thought bubble reaching up into the bar)
+        bool inOverlay = false;
+        for (const auto& o : c->ffOverlays) {
+            const float ix = std::min(g.hi[0], o[2]) - std::max(g.lo[0], o[0]), iy = std::min(g.hi[1], o[3]) - std::max(g.lo[1], o[1]);
+            inOverlay |= ix > 0 && iy > 0 && ix * iy >= 0.7f * std::max(w * h, 1e-8f);
+        }
+        if (inOverlay) {
+            what = "in overlay";
+        } else {
+            bool join = c->ffRunOn && c->ffRunFb == c->drawFb;
+            if (join) {
+                const float ox = std::min(g.hi[0], c->ffRun[2]) - std::max(g.lo[0], c->ffRun[0]);
+                join = ox >= 0.6f * std::max(w, 1e-6f) && g.lo[1] <= c->ffRun[3] + 0.02f && g.hi[1] >= c->ffRun[1] - 0.02f;
+            }
+            if (join) {
+                c->ffRun[0] = std::min(c->ffRun[0], g.lo[0]);
+                c->ffRun[1] = std::min(c->ffRun[1], g.lo[1]);
+                c->ffRun[2] = std::max(c->ffRun[2], g.hi[0]);
+                c->ffRun[3] = std::max(c->ffRun[3], g.hi[1]);
+                what = "part";
+            } else {
+                c->ffRun[0] = g.lo[0];
+                c->ffRun[1] = g.lo[1];
+                c->ffRun[2] = g.hi[0];
+                c->ffRun[3] = g.hi[1];
+                c->ffRunOn = true;
+                c->ffRunFb = c->drawFb;
+                // drawn over an object drawn before it, it is no farther than that object, or the eyes see
+                // it behind what it covers (a thought bubble over the robot's head)
+                c->ffRunCap = 1e30f;
+                for (const Ctx::FfObj& o : c->ffObjects)
+                    if (o.fb == c->drawFb && o.box[0] < g.hi[0] - g.tol && g.lo[0] < o.box[2] - g.tol && o.box[1] < g.hi[1] - g.tol &&
+                        g.lo[1] < o.box[3] - g.tol)
+                        c->ffRunCap = std::min(c->ffRunCap, o.depth);
+                if (c->ffObjects.size() < 4096) c->ffObjects.push_back({c->drawFb, {g.lo[0], g.lo[1], g.hi[0], g.hi[1]}, 0.0f});
+            }
+            c->ffKind = 1;
+            c->ffDepth = std::min(std::max(t(c->ffRun[1]), g_cfg.flatSpriteMin), c->ffRunCap);
+            if (!c->ffObjects.empty()) {   // the object's entry: its box so far and its depth
+                Ctx::FfObj& o = c->ffObjects.back();
+                memcpy(o.box, c->ffRun, sizeof(o.box));
+                o.depth = c->ffDepth;
+            }
+            c->ffSprites++;
+        }
+    }
+    if (g.mapped && !rep && c->pictures.size() < 1024) {
+        Ctx::Picture pic{c->drawFb, g.tex, {}, 0, 0, c->ffKind, c->ffDepth};
+        memcpy(pic.m, g.m, sizeof(pic.m));
+        c->pictures.push_back(pic);
+    }
+    if (g_traceNow)
+        Log("T %u.%u feet %s: kind %d depth %.3f box %.3f,%.3f-%.3f,%.3f tex %u", g_frame, g_traceDraw, what, c->ffKind,
+            c->ffKind == 1 ? c->ffDepth : 0.0f, g.lo[0], g.lo[1], g.hi[0], g.hi[1], g.mapped ? g.tex : 0);
 }
 
 void OrderDepthForDraw(Ctx* c)
@@ -988,7 +1100,7 @@ void OrderDepthForDraw(Ctx* c)
     c->flatEvents.push_back(ev);
     if (geom && c->ffBoxes.size() < 4096) {
         if (fg.mapped && !repeat) {
-            Ctx::Picture pic{c->drawFb, fg.tex, {}, c->groupKey, c->ffBoxes.size()};
+            Ctx::Picture pic{c->drawFb, fg.tex, {}, c->groupKey, c->ffBoxes.size(), 0, 0.0f};
             memcpy(pic.m, fg.m, sizeof(pic.m));
             c->pictures.push_back(pic);
         }
@@ -1052,6 +1164,10 @@ void ComputeLayout(Ctx* c)
     std::vector<FlatEv>& ev = c->flatEvents;
     c->pictures.clear();
     c->ffBoxes.clear();
+    c->ffSprites = 0;
+    c->ffRunOn = false;
+    c->ffOverlays.clear();
+    c->ffObjects.clear();
     c->layoutPos.clear();
     c->layoutCount = 0;
     if (ev.empty()) return;
@@ -1286,14 +1402,20 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
     if (eye == 0.0f || !c->compat || !g_cfg.fixedFunction) return;
     GLfloat p[16];
     R.GetFloatv(GL_PROJECTION_MATRIX, p);
-    float s = eye * SepValue(), shift;
+    float s = eye * SepValue(), shift, slope = 0.0f;
     if (p[15] != 0.0f || p[11] == 0.0f) {
         // orthographic (flat 2D, Machinarium): with flat depth on, the draw's order-rule depth as a fixed
-        // x shift per w (no per-sprite spread: there is no geometry shader on this path)
-        if (!c->program && g_cfg.flatEnable && g_cfg.flatRule == 1 && c->isMain &&
-            !((g_cfg.flatScreenBatch > 0 && c->batch >= g_cfg.flatScreenBatch) || SamplesStereoTarget(c)))
+        // x shift per w (no per-sprite spread: there is no geometry shader on this path); feet rule: the
+        // object's depth, or the floor's slope (shift grows with clip y)
+        const bool flat = !c->program && g_cfg.flatEnable && c->isMain;
+        if (flat && g_cfg.flatRule == 1 && !((g_cfg.flatScreenBatch > 0 && c->batch >= g_cfg.flatScreenBatch) || SamplesStereoTarget(c)))
             shift = s * ((c->orderDepth + c->orderSlot * 0.4f) * g_cfg.flatTop - g_cfg.flatZero);
-        else
+        else if (flat && g_cfg.flatRule == 0 && c->ffKind == 1)
+            shift = s * c->ffDepth;
+        else if (flat && g_cfg.flatRule == 0 && c->ffKind == 2) {
+            shift = s * (0.5f * g_cfg.flatTop - g_cfg.flatZero);
+            slope = s * 0.5f * g_cfg.flatTop;
+        } else
             return;   // 2D at the screen
     } else {
         shift = 0.0f;   // perspective: below
@@ -1301,11 +1423,11 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
     R.GetIntegerv(GL_MATRIX_MODE, &st.mode);
     memcpy(st.proj, p, sizeof(p));
     if (p[15] != 0.0f || p[11] == 0.0f) {
-        // clip.x += shift * clip.w: row 0 += shift * row 3
-        p[0] += shift * p[3];
-        p[4] += shift * p[7];
-        p[8] += shift * p[11];
-        p[12] += shift * p[15];
+        // clip.x += shift * clip.w + slope * clip.y: row 0 += shift * row 3 + slope * row 1
+        p[0] += shift * p[3] + slope * p[1];
+        p[4] += shift * p[7] + slope * p[5];
+        p[8] += shift * p[11] + slope * p[9];
+        p[12] += shift * p[15] + slope * p[13];
         R.MatrixMode(GL_PROJECTION);
         R.LoadMatrixf(p);
         if ((GLenum)st.mode != GL_PROJECTION) R.MatrixMode(st.mode);
@@ -1395,6 +1517,7 @@ void StereoDraw(F&& draw)
     // fixed-function draws (their orthographic projection gets the offset)
     const bool fixedFn = !c->program && !c->arbActive && c->compat && g_cfg.fixedFunction;
     if (((pi && pi->gs) || ((c->arbActive || fixedFn) && g_cfg.flatEnable)) && g_cfg.flatRule == 1 && c->isMain) OrderDepthForDraw(c);
+    else if (fixedFn && g_cfg.flatEnable && g_cfg.flatRule == 0 && c->isMain) FeetDepthForDraw(c);
     if (pi && pi->gs && t_drawMode != GL_TRIANGLES && t_drawMode != GL_TRIANGLE_STRIP && t_drawMode != GL_TRIANGLE_FAN) {
         // a geometry shader only takes triangles; points/lines would fail (TODO: GS-less twin program)
         static int logged;
