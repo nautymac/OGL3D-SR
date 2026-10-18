@@ -88,6 +88,12 @@ struct PresentState {
     bool failed = false;
     bool shown = false;
     bool owned = false;   // owned by the game window (else a topmost window)
+    bool foreign = false; // the window belongs to the game window's thread, not the one presenting
+    bool requested = false;
+    volatile LONG made = 0;   // window creation: 0 pending, 1 done, -1 failed
+    HHOOK makeHook = nullptr;
+    UINT makeMsg = 0;
+    unsigned waited = 0;  // frames presented in the game's window while the window is being made
     unsigned frames = 0;
 } g;
 
@@ -186,15 +192,9 @@ bool CreateSwapChain()
     return ok && CreateBackBufferView();
 }
 
-bool CreatePresenter(HWND game)
+// The presentation window, made on the calling thread.
+void MakeWindow()
 {
-    RECT r;
-    if (!GameClientRect(game, r)) return false;
-    g.game = game;
-    g.x = r.left;
-    g.y = r.top;
-    g.w = r.right - r.left;
-    g.h = r.bottom - r.top;
     {
         PhysicalDpiScope dpi;
         WNDCLASSEXW wc{sizeof(wc)};
@@ -210,7 +210,7 @@ bool CreatePresenter(HWND game)
         // Owned by the game window it stays right above it in the z-order (and below any other app
         // the user switches to) without being topmost. Windows may give an owned window its owner's
         // DPI awareness; then it is recreated without owner as a topmost window.
-        for (HWND owner : {game, (HWND) nullptr}) {
+        for (HWND owner : {g.game, (HWND) nullptr}) {
             g.wnd = CreateWindowExW((owner ? 0 : WS_EX_TOPMOST) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName,
                                     L"OGL3D", WS_POPUP, g.x, g.y, g.w, g.h, owner, nullptr, wc.hInstance, nullptr);
             if (!g.wnd) break;
@@ -225,11 +225,63 @@ bool CreatePresenter(HWND game)
             g.wnd = nullptr;
         }
     }
-    if (!g.wnd) {
-        Log("upscale: could not create a per-monitor DPI aware window (%lu)", GetLastError());
-        return false;
+    InterlockedExchange(&g.made, g.wnd ? 1 : -1);
+}
+
+// Runs on the game window's thread when it takes our message from its queue.
+LRESULT CALLBACK MakeWindowHook(int code, WPARAM remove, LPARAM lp)
+{
+    MSG* m = (MSG*)lp;
+    if (code == HC_ACTION && m && g.makeMsg && m->message == g.makeMsg) {
+        if (g.made == 0) MakeWindow();
+        m->message = WM_NULL;
     }
-    if (!CreateDevice() || !CreateSwapChain()) return false;
+    return CallNextHookEx(nullptr, code, remove, lp);
+}
+
+// The presentation window belongs to the game window's thread: HTTRANSPARENT passes the mouse only to
+// windows of the same thread, and that thread's message loop serves it. A game that renders on another
+// thread (WineD3D's command stream thread) has the window made on the game window's thread through a
+// message hook, without waiting for it here (that thread may be waiting for this one); until then the
+// frames go to the game's window. Returns 1 ready, 0 not yet, -1 failed.
+int OpenPresenter(HWND game)
+{
+    if (!g.requested) {
+        RECT r;
+        if (!GameClientRect(game, r)) return -1;
+        g.requested = true;
+        g.game = game;
+        g.x = r.left;
+        g.y = r.top;
+        g.w = r.right - r.left;
+        g.h = r.bottom - r.top;
+        const DWORD tid = GetWindowThreadProcessId(game, nullptr);
+        if (tid == GetCurrentThreadId()) {
+            MakeWindow();
+        } else {
+            g.foreign = true;
+            g.makeMsg = RegisterWindowMessageW(L"OGL3D_MakePresentWindow");
+            g.makeHook = SetWindowsHookExW(WH_GETMESSAGE, MakeWindowHook, nullptr, tid);
+            if (!g.makeHook || !PostMessageW(game, g.makeMsg, 0, 0)) {
+                Log("upscale: could not reach the game window's thread %lu (%lu)", tid, GetLastError());
+                return -1;
+            }
+            Log("upscale: the game renders on another thread than its window's (%lu): window made there", tid);
+        }
+    }
+    if (g.made == 0) {
+        if (++g.waited == 600) Log("upscale: the game window's thread has not taken the request yet");
+        return g.waited > 3600 ? -1 : 0;
+    }
+    if (g.makeHook) {
+        UnhookWindowsHookEx(g.makeHook);
+        g.makeHook = nullptr;
+    }
+    if (g.made < 0 || !g.wnd) {
+        Log("upscale: could not create a per-monitor DPI aware window (%lu)", GetLastError());
+        return -1;
+    }
+    if (!CreateDevice() || !CreateSwapChain()) return -1;
     g.open = (DXOpenDeviceFn)R.wglGetProcAddress("wglDXOpenDeviceNV");
     g.reg = (DXRegisterObjectFn)R.wglGetProcAddress("wglDXRegisterObjectNV");
     g.unreg = (DXUnregisterObjectFn)R.wglGetProcAddress("wglDXUnregisterObjectNV");
@@ -237,10 +289,10 @@ bool CreatePresenter(HWND game)
     g.unlock = (DXLockObjectsFn)R.wglGetProcAddress("wglDXUnlockObjectsNV");
     if (!g.open || !g.reg || !g.unreg || !g.lock || !g.unlock || !(g.interop = g.open(g.dev))) {
         Log("upscale: WGL_NV_DX_interop2 unavailable");
-        return false;
+        return -1;
     }
     Log("upscale: D3D11 presentation window %dx%d at %d,%d (game renders at its own resolution)", g.w, g.h, g.x, g.y);
-    return true;
+    return 1;
 }
 
 void ReleaseInterop(InteropTex& t)
@@ -301,7 +353,8 @@ bool ShouldShow()
 void Show(bool on)
 {
     if (on == g.shown) return;
-    ShowWindow(g.wnd, on ? SW_SHOWNOACTIVATE : SW_HIDE);
+    if (g.foreign) ShowWindowAsync(g.wnd, on ? SW_SHOWNOACTIVATE : SW_HIDE);   // its thread may be waiting for this one
+    else ShowWindow(g.wnd, on ? SW_SHOWNOACTIVATE : SW_HIDE);
     g.shown = on;
     Log("upscale: presentation window %s", on ? "shown" : "hidden (game minimized or in the background)");
 }
@@ -315,7 +368,7 @@ void FollowGameWindow()
     {
         PhysicalDpiScope dpi;
         SetWindowPos(g.wnd, g.owned ? nullptr : HWND_TOPMOST, r.left, r.top, w, h,
-                     SWP_NOACTIVATE | (g.owned ? SWP_NOZORDER : 0));
+                     SWP_NOACTIVATE | (g.owned ? SWP_NOZORDER : 0) | (g.foreign ? SWP_ASYNCWINDOWPOS : 0));
     }
     if (w != g.w || h != g.h) {
         SafeRelease(g.rtv);
@@ -548,10 +601,13 @@ void InstallDisplayModeHooks()
 bool PresentFrame(HWND game, GLuint sbsFbo, int eyeW, int eyeH, bool weave)
 {
     if (g.failed) return false;
-    if (!g.wnd && !CreatePresenter(game)) {
-        g.failed = true;
-        Log("upscale: unavailable, the game's own window is used");
-        return false;
+    if (!g.sc) {
+        const int open = OpenPresenter(game);
+        if (open < 0) {
+            g.failed = true;
+            Log("upscale: unavailable, the game's own window is used");
+        }
+        if (open <= 0) return false;
     }
     const bool show = ShouldShow();
     Show(show);
@@ -620,8 +676,11 @@ bool PresentFrame(HWND game, GLuint sbsFbo, int eyeW, int eyeH, bool weave)
 
 void PresentShutdown()
 {
+    if (g.makeHook) UnhookWindowsHookEx(g.makeHook);
+    g.makeHook = nullptr;
     if (g.wnd) {
-        DestroyWindow(g.wnd);
+        if (g.foreign) PostMessageW(g.wnd, WM_CLOSE, 0, 0);   // destroyed by its own thread
+        else DestroyWindow(g.wnd);
         g.wnd = nullptr;
     }
 }
