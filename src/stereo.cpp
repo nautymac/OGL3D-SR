@@ -948,6 +948,10 @@ void FeetDepthForDraw(Ctx* c)
         c->ffDepth = rep->depth;
         c->ffRunOn = false;
         what = "repeat";
+    } else if (g_cfg.flatPlaneTall > 0.0f && h >= g_cfg.flatPlaneTall && !(w >= g_cfg.flatPlane && h >= g_cfg.flatPlaneHeight)) {
+        c->ffKind = 2;   // a tall piece of a picture: on the floor slope like the rest of it
+        c->ffRunOn = false;
+        what = "tall";
     } else if (w >= g_cfg.flatPlane && h >= g_cfg.flatPlaneHeight) {
         if (c->ffSprites == 0) {
             c->ffKind = 2;
@@ -995,7 +999,8 @@ void FeetDepthForDraw(Ctx* c)
                 if (c->ffObjects.size() < 4096) c->ffObjects.push_back({c->drawFb, {g.lo[0], g.lo[1], g.hi[0], g.hi[1]}, 0.0f});
             }
             c->ffKind = 1;
-            c->ffDepth = std::min(std::max(t(c->ffRun[1]), g_cfg.flatSpriteMin), c->ffRunCap);
+            // sprite_min moves with the screen plane (depth_screen, Ctrl+F5/F6), or bottom sprites stay behind the floor
+            c->ffDepth = std::min(std::max(t(c->ffRun[1]), g_cfg.flatSpriteMin - g_cfg.flatZero), c->ffRunCap);
             if (!c->ffObjects.empty()) {   // the object's entry: its box so far and its depth
                 Ctx::FfObj& o = c->ffObjects.back();
                 memcpy(o.box, c->ffRun, sizeof(o.box));
@@ -1358,7 +1363,9 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
                     slot *= scale;
                 }
             }
-            const float v[4] = {d, order ? slot : g_cfg.flatSpriteMin, order ? c->drawPrims : g_cfg.flatPlaneHeight, w};
+            // feet: sprite_min moves with the screen plane (depth_screen), like the floor slope does
+            const float v[4] = {d, order ? slot : g_cfg.flatSpriteMin - g_cfg.flatZero, order ? c->drawPrims : g_cfg.flatPlaneHeight,
+                                order ? w : g_cfg.flatPlaneTall};
             if (memcmp(v, pi->lastD, sizeof(v)) != 0) {
                 R.Uniform4f(pi->locD, v[0], v[1], v[2], v[3]);
                 memcpy(pi->lastD, v, sizeof(v));

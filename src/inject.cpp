@@ -322,7 +322,7 @@ layout(triangles) in;
 layout(triangle_strip, max_vertices = 3) out;
 uniform vec4 s3d_P; // x = eye, y = separation
 uniform vec4 s3d_F; // x = 1 feet rule, 2 order rule, y = depth at the top of the screen, z = plane width (NDC), w = depth on the screen plane
-uniform vec4 s3d_D; // x = 1: this draw stays at screen depth; feet rule: y = nearest sprite depth, z = plane height (NDC); order rule: y = depth slot of the group, z = primitives in the draw, w = group depth
+uniform vec4 s3d_D; // x = 1: this draw stays at screen depth; feet rule: y = nearest sprite depth, z = plane height (NDC), w = height that makes a plane whatever the width (0 = off); order rule: y = depth slot of the group, z = primitives in the draw, w = group depth
 )";
     for (const VsOutput& o : vs.outs) {
         std::string q = o.quals;
@@ -352,7 +352,8 @@ void main()
             float s3d_n = floor(s3d_D.z * 0.5);
             float s3d_q = s3d_n > 1.5 ? clamp(floor(float(gl_PrimitiveIDIn) * 0.5) / (s3d_n - 1.0), 0.0, 1.0) : 1.0;
             s3d_d = vec3(s3d_D.w + s3d_D.y * (1.0 - s3d_q));
-        } else if (s3d_hi.x - s3d_lo.x >= s3d_F.z && s3d_hi.y - s3d_lo.y >= s3d_D.z)   // wide (and high): layer / overlay plane
+        } else if ((s3d_hi.x - s3d_lo.x >= s3d_F.z && s3d_hi.y - s3d_lo.y >= s3d_D.z) ||   // wide (and high): layer / overlay plane,
+                   (s3d_D.w > 0.0 && s3d_hi.y - s3d_lo.y >= s3d_D.w))                    // or a tall piece of a picture
             // slopes back with the screen height; vertices far off screen (Door Kickers draws overlays
             // with corners thousands of units away) are clamped, or the slope runs away
             s3d_d = vec3(s3d_t(clamp(s3d_p0.y, -1.0, 1.0)), s3d_t(clamp(s3d_p1.y, -1.0, 1.0)), s3d_t(clamp(s3d_p2.y, -1.0, 1.0)));

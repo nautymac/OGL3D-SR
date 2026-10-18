@@ -152,6 +152,7 @@ void LoadConfig()
     c.flatZero = IniFloat(L"Flat", L"depth_screen", c.flatZero);
     c.flatPlane = IniFloat(L"Flat", L"plane_size", c.flatPlane);
     c.flatPlaneHeight = IniFloat(L"Flat", L"plane_height", c.flatPlaneHeight);
+    c.flatPlaneTall = IniFloat(L"Flat", L"plane_tall", c.flatPlaneTall);
     c.flatSpriteMin = IniFloat(L"Flat", L"sprite_min", c.flatSpriteMin);
     c.flatScreenBatch = IniInt(L"Flat", L"screen_batch", c.flatScreenBatch);
     c.flatCacheScale = IniFloat(L"Flat", L"cache_scale", c.flatCacheScale);
@@ -237,8 +238,8 @@ void LoadConfig()
         c.enable, c.separation, c.maxSeparation, c.convergence, c.autoConvergence ? " (auto)" : "", c.output,
         c.swapEyes, c.monoW1, c.inject, c.blockProgramBinary, c.overrides.size());
     if (c.flatEnable)
-        Log("flat depth: rule=%s top=%.2f screen=%.2f plane=%.2fx%.2f sprite_min=%.2f screen_batch=%d", c.flatRule ? "order" : "feet", c.flatTop, c.flatZero,
-            c.flatPlane, c.flatPlaneHeight, c.flatSpriteMin, c.flatScreenBatch);
+        Log("flat depth: rule=%s top=%.2f screen=%.2f plane=%.2fx%.2f tall=%.2f sprite_min=%.2f screen_batch=%d", c.flatRule ? "order" : "feet", c.flatTop,
+            c.flatZero, c.flatPlane, c.flatPlaneHeight, c.flatPlaneTall, c.flatSpriteMin, c.flatScreenBatch);
 }
 
 const wchar_t* ModeName(int mode)

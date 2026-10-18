@@ -40,6 +40,7 @@ struct Config {
     float flatZero = 0.0f;        // depth that sits on the screen plane
     float flatPlane = 1.2f;       // a quad at least this wide (NDC, 2 = screen) is a plane (background layer, overlay)
     float flatPlaneHeight = 0.0f; // ... and at least this high (AGS: 1.8, so wide walk-behinds stay sprites)
+    float flatPlaneTall = 0.0f;   // a quad at least this high is a plane whatever its width (0 = off; Samorost 2: pictures in pieces)
     float flatSpriteMin = -0.25f; // sprites never come nearer than this depth
     int flatScreenBatch = 1;      // draws from this scissor/viewport batch on stay at screen depth (0 = off)
     float flatCacheScale = 0.0f;  // offset scale inside off-screen layer caches (0 = auto: scissored part of the viewport)
