@@ -56,6 +56,7 @@ struct Config {
     bool dumpShaders = false;
     int cgGlsl = 0;               // NVIDIA Cg games: make cgGLGetLatestProfile answer GLSL (1); off by default (Rocketbirds turned white)
     bool arbPrograms = true;      // rewrite ARB/NV assembly vertex programs (Cg arbvp1) for the stereo offset
+    std::wstring addArgs;         // appended to the game's command line (Machinarium: -ogl picks its OpenGL renderer)
     // [Targets]
     int minTargetWidth = 64;
     float aspectTolerance = 0.03f;
@@ -114,6 +115,8 @@ bool OnSwapBuffers(HDC dc);       // true: the frame was presented in our window
 
 // cghook.cpp
 void InstallCgGlslHooks();        // [Inject] cg_glsl: Cg programs compile to GLSL
+bool PatchModuleImport(HMODULE m, const char* dll, const char* name, void* hook);
+void InstallCommandLineArgs();    // [Inject] add_args: arguments appended to the game's command line
 
 // present.cpp (upscale mode)
 void InstallDisplayModeHooks();

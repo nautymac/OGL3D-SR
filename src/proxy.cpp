@@ -177,6 +177,7 @@ void LoadConfig()
     c.blockProgramBinary = IniInt(L"Inject", L"block_program_binary", c.blockProgramBinary) != 0;
     c.cgGlsl = IniInt(L"Inject", L"cg_glsl", c.cgGlsl);
     c.arbPrograms = IniInt(L"Inject", L"arb_programs", c.arbPrograms) != 0;
+    c.addArgs = IniStr(L"Inject", L"add_args", L"");
     c.dumpShaders = IniInt(L"Inject", L"dump_shaders", c.dumpShaders) != 0;
     c.minTargetWidth = IniInt(L"Targets", L"min_width", c.minTargetWidth);
     c.aspectTolerance = IniFloat(L"Targets", L"aspect_tolerance", c.aspectTolerance);
@@ -497,6 +498,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         Log("OGL3D " OGL3D_VERSION " (opengl32 proxy, %s) loaded into %ls", sizeof(void*) == 8 ? "x64" : "x86", exe);
         LoadConfig();
         if (g_cfg.logCrashes) AddVectoredExceptionHandler(1, CrashLogger);
+        if (!g_cfg.addArgs.empty()) InstallCommandLineArgs();   // before the game's startup code parses it
         // upscale: the game stays DPI-unaware at its own resolution (readable UI) and must not
         // switch the panel's display mode; we present at native resolution ourselves
         if (g_cfg.upscale) InstallDisplayModeHooks();

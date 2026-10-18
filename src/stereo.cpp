@@ -286,6 +286,9 @@ std::unordered_map<GLuint, uint32_t> g_arbFpUnits; // ARB fragment program -> te
 #ifndef GL_FRAGMENT_PROGRAM_ARB
 #define GL_FRAGMENT_PROGRAM_ARB 0x8804
 #endif
+#ifndef GL_ACTIVE_TEXTURE
+#define GL_ACTIVE_TEXTURE 0x84E0
+#endif
 #ifndef GL_PROGRAM_FORMAT_ASCII_ARB
 #define GL_PROGRAM_FORMAT_ASCII_ARB 0x8875
 #endif
@@ -698,6 +701,20 @@ uint32_t SampledUnits(Ctx* c)
         auto it = g_arbFpUnits.find(c->arbFp);
         if (it != g_arbFpUnits.end()) return it->second;
     }
+    if (!c->program && c->compat) {
+        // fixed function: the units with 2D texturing enabled (render targets left on other units are not read)
+        // (GL's active unit is read back: a game may switch it through a path we do not track)
+        uint32_t m = 0;
+        GLint active = GL_TEXTURE0;
+        R.GetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        const int last = std::min(std::max(c->maxUnit, (int)(active - GL_TEXTURE0)), 7);
+        for (int u = 0; u <= last; ++u) {
+            if (GL_TEXTURE0 + u != active) R.ActiveTexture(GL_TEXTURE0 + u);
+            if (R.IsEnabled(GL_TEXTURE_2D)) m |= 1u << u;
+        }
+        if (last > 0 || active != GL_TEXTURE0) R.ActiveTexture(active);
+        return m;
+    }
     ProgInfo* pi = c->program ? FindProg(c->program) : nullptr;
     if (!pi || !pi->samplersKnown || !R.GetUniformiv) return ~0u;
     if (!pi->unitsRead) {
@@ -784,7 +801,9 @@ void OrderDepthForDraw(Ctx* c)
         c->flatEvents.push_back(ev);
         return;
     }
-    const uint64_t id = ((uint64_t)c->program << 32) ^ texKey;
+    // fixed-function and ARB draws have no GLSL program; the salt keeps an untextured one's key from being 0 (no layer)
+    const uint64_t prog = c->program ? c->program : c->arbActive ? 0x80000000u | c->arbVp : 0;
+    const uint64_t id = ((prog << 32) ^ texKey) ^ 0x5BD1E995ull;
     if (id != c->groupId || c->frameGroups == 0 || g_cfg.flatGroupByDraw) {
         c->groupId = id;
         int seen = 0;
@@ -891,16 +910,27 @@ void ComputeLayout(Ctx* c)
             }
         }
     }
+    // the picture is the target drawn last (trailing copies to the window carry no layers; with no
+    // program at all, fixed-function or ARB, the last event's target: Machinarium's copy to the window
+    // leads back to the scene, Rocketbirds' composite into the window follows its bloom passes)
+    GLuint root = ev.back().fb;
+    for (size_t i = ev.size(); i-- > 0;)
+        if (ev[i].prog) {
+            root = ev[i].fb;
+            break;
+        }
     // A scratch target, cleared and drawn again more than once in the frame (Astral Ascent renders
     // every piece of text into one, glyph by glyph, and composites it): each use is one layer,
     // placed where it is composited, or the glyphs of a line step forward one after another.
+    // Not the picture itself: Rocketbirds draws the scene into the window, copies it out, clears
+    // the window and draws the copy back with the HUD (one use would flatten the whole scene).
     std::unordered_map<GLuint, int> uses;
     {
         std::unordered_map<GLuint, bool> drawn;   // drawn into since its last clear
         for (const FlatEv& e : ev) {
             if (e.clear) {
                 drawn[e.fb] = false;
-            } else if (e.key && !drawn[e.fb]) {
+            } else if (e.key && !drawn[e.fb] && e.fb != root) {
                 drawn[e.fb] = true;
                 uses[e.fb]++;
             }
@@ -927,13 +957,6 @@ void ComputeLayout(Ctx* c)
         for (auto& u : uses)
             if (u.second >= 2) scratch += " fb" + std::to_string(u.first) + "x" + std::to_string(u.second);
     }
-    // the picture is the target drawn last (trailing copies to the window carry no layers)
-    GLuint root = ev.back().fb;
-    for (size_t i = ev.size(); i-- > 0;)
-        if (ev[i].prog) {
-            root = ev[i].fb;
-            break;
-        }
     std::vector<uint64_t> order;
     WalkLayout(ev, alias, root, ev.size(), 0, order);
     const size_t n = order.size();
@@ -1081,11 +1104,34 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
     if (eye == 0.0f || !c->compat || !g_cfg.fixedFunction) return;
     GLfloat p[16];
     R.GetFloatv(GL_PROJECTION_MATRIX, p);
-    if (p[15] != 0.0f || p[11] == 0.0f) return;   // not a perspective projection
+    float s = eye * SepValue(), shift;
+    if (p[15] != 0.0f || p[11] == 0.0f) {
+        // orthographic (flat 2D, Machinarium): with flat depth on, the draw's order-rule depth as a fixed
+        // x shift per w (no per-sprite spread: there is no geometry shader on this path)
+        if (!c->program && g_cfg.flatEnable && g_cfg.flatRule == 1 && c->isMain &&
+            !((g_cfg.flatScreenBatch > 0 && c->batch >= g_cfg.flatScreenBatch) || SamplesStereoTarget(c)))
+            shift = s * ((c->orderDepth + c->orderSlot * 0.4f) * g_cfg.flatTop - g_cfg.flatZero);
+        else
+            return;   // 2D at the screen
+    } else {
+        shift = 0.0f;   // perspective: below
+    }
     R.GetIntegerv(GL_MATRIX_MODE, &st.mode);
     memcpy(st.proj, p, sizeof(p));
+    if (p[15] != 0.0f || p[11] == 0.0f) {
+        // clip.x += shift * clip.w: row 0 += shift * row 3
+        p[0] += shift * p[3];
+        p[4] += shift * p[7];
+        p[8] += shift * p[11];
+        p[12] += shift * p[15];
+        R.MatrixMode(GL_PROJECTION);
+        R.LoadMatrixf(p);
+        if ((GLenum)st.mode != GL_PROJECTION) R.MatrixMode(st.mode);
+        st.matrix = true;
+        g_stats.matrixDraws++;
+        return;
+    }
     // clip.x += eye * sep * (clip.w - convergence), with eye-space w == 1
-    float s = eye * SepValue();
     p[0] += s * p[3];
     p[4] += s * p[7];
     p[8] += s * p[11];
@@ -1163,7 +1209,10 @@ void StereoDraw(F&& draw)
     }
     // an ARB assembly vertex program we rewrote (no GLSL program bound)
     c->arbActive = !c->program && c->arbVp && g_arbVp.count(c->arbVp) && R.IsEnabled(GL_VERTEX_PROGRAM_ARB);
-    if (((pi && pi->gs) || (c->arbActive && g_cfg.flatEnable)) && g_cfg.flatRule == 1 && c->isMain) OrderDepthForDraw(c);
+    // order depth for the draws that can take it: GLSL with our geometry shader, rewritten ARB programs, and
+    // fixed-function draws (their orthographic projection gets the offset)
+    const bool fixedFn = !c->program && !c->arbActive && c->compat && g_cfg.fixedFunction;
+    if (((pi && pi->gs) || ((c->arbActive || fixedFn) && g_cfg.flatEnable)) && g_cfg.flatRule == 1 && c->isMain) OrderDepthForDraw(c);
     if (pi && pi->gs && t_drawMode != GL_TRIANGLES && t_drawMode != GL_TRIANGLE_STRIP && t_drawMode != GL_TRIANGLE_FAN) {
         // a geometry shader only takes triangles; points/lines would fail (TODO: GS-less twin program)
         static int logged;
@@ -1194,9 +1243,10 @@ void StereoDraw(F&& draw)
     TraceStep(c);
 }
 
-// Clears and other target-only operations: both eyes, no eye offset.
+// Clears and other target-only operations: both eyes, no eye offset. color: the colour buffer is
+// cleared (a stencil-only clear for a mask, Machinarium, does not start a new picture).
 template <class F>
-void StereoTargetOp(F&& op)
+void StereoTargetOp(F&& op, bool color = true)
 {
     Ctx* c = t_ctx;
     if (!c || c->listMode) {
@@ -1205,7 +1255,7 @@ void StereoTargetOp(F&& op)
     }
     std::lock_guard<std::recursive_mutex> lk(g_lock);
     if (c->drawFb == 0) c->fb0Touched = true;
-    if (g_cfg.flatEnable && g_cfg.flatRule == 1 && c->isMain) {   // for scratch targets (ComputeLayout)
+    if (g_cfg.flatEnable && g_cfg.flatRule == 1 && c->isMain && color) {   // for scratch targets (ComputeLayout)
         FlatEv ev;
         ev.fb = c->drawFb;
         ev.clear = true;
@@ -3818,12 +3868,12 @@ void GLAPIENTRY H_MultiDrawElements(GLenum mode, const GLsizei* count, GLenum ty
 
 void GLAPIENTRY H_ClearBufferfv(GLenum buf, GLint drawbuf, const GLfloat* v)
 {
-    StereoTargetOp([&] { R.ClearBufferfv(buf, drawbuf, v); });
+    StereoTargetOp([&] { R.ClearBufferfv(buf, drawbuf, v); }, buf == GL_COLOR);
 }
 
 void GLAPIENTRY H_ClearBufferiv(GLenum buf, GLint drawbuf, const GLint* v)
 {
-    StereoTargetOp([&] { R.ClearBufferiv(buf, drawbuf, v); });
+    StereoTargetOp([&] { R.ClearBufferiv(buf, drawbuf, v); }, buf == GL_COLOR);
 }
 
 void GLAPIENTRY H_ClearBufferuiv(GLenum buf, GLint drawbuf, const GLuint* v)
@@ -3833,7 +3883,7 @@ void GLAPIENTRY H_ClearBufferuiv(GLenum buf, GLint drawbuf, const GLuint* v)
 
 void GLAPIENTRY H_ClearBufferfi(GLenum buf, GLint drawbuf, GLfloat d, GLint s)
 {
-    StereoTargetOp([&] { R.ClearBufferfi(buf, drawbuf, d, s); });
+    StereoTargetOp([&] { R.ClearBufferfi(buf, drawbuf, d, s); }, false);
 }
 
 HGLRC GLAPIENTRY H_wglCreateContextAttribsARB(HDC dc, HGLRC share, const int* attribs)
@@ -4304,7 +4354,7 @@ void WINAPI H_glViewport(GLint x, GLint y, GLsizei w, GLsizei h)
 void WINAPI H_glClear(GLbitfield mask)
 {
     TraceDraw("Clear", mask, 0);
-    StereoTargetOp([&] { R.Clear(mask); });
+    StereoTargetOp([&] { R.Clear(mask); }, (mask & GL_COLOR_BUFFER_BIT) != 0);
 }
 
 void WINAPI H_glBindTexture(GLenum target, GLuint texture)

@@ -56,8 +56,11 @@ int __cdecl HookGetLatestProfile(int type)
     return real;
 }
 
-// Redirects module m's import dll!name to hook; true when patched.
-bool PatchImport(HMODULE m, const char* dll, const char* name, void* hook)
+}   // namespace
+
+// Redirects module m's import dll!name to hook (dll compared without case; "*kernel32*"-style
+// matching is up to the caller passing each name); true when patched.
+bool PatchModuleImport(HMODULE m, const char* dll, const char* name, void* hook)
 {
     auto base = (uint8_t*)m;
     auto dos = (IMAGE_DOS_HEADER*)base;
@@ -85,14 +88,57 @@ bool PatchImport(HMODULE m, const char* dll, const char* name, void* hook)
     return patched;
 }
 
+namespace {
+
 bool PatchCgImport(HMODULE m)
 {
-    bool a = PatchImport(m, "cgGL.dll", "cgGLGetLatestProfile", (void*)&HookGetLatestProfile);
-    if (g_realCreate) PatchImport(m, "cg.dll", "cgCreateProgram", (void*)&HookCreateProgram);
+    bool a = PatchModuleImport(m, "cgGL.dll", "cgGLGetLatestProfile", (void*)&HookGetLatestProfile);
+    if (g_realCreate) PatchModuleImport(m, "cg.dll", "cgCreateProgram", (void*)&HookCreateProgram);
     return a;
 }
 
 }   // namespace
+
+// [Inject] add_args: the game's modules (and the C runtime, which builds argv) get GetCommandLineW/A answering
+// with the arguments appended. Runs in DllMain, before the exe's startup code reads its command line, so a
+// switch the store does not pass (Machinarium's -ogl) still reaches the game.
+namespace {
+std::vector<wchar_t> g_cmdW;
+std::vector<char> g_cmdA;
+LPWSTR WINAPI HookGetCommandLineW() { return g_cmdW.data(); }
+LPSTR WINAPI HookGetCommandLineA() { return g_cmdA.data(); }
+}   // namespace
+
+void InstallCommandLineArgs()
+{
+    const std::wstring w = std::wstring(GetCommandLineW()) + L" " + g_cfg.addArgs;
+    std::string a = GetCommandLineA();
+    a += ' ';
+    for (wchar_t ch : g_cfg.addArgs) a += (char)(ch < 128 ? ch : '?');
+    g_cmdW.assign(w.begin(), w.end());
+    g_cmdW.push_back(0);
+    g_cmdA.assign(a.begin(), a.end());
+    g_cmdA.push_back(0);
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&InstallCommandLineArgs, &self);
+    static const char* kDlls[] = {"kernel32.dll", "kernelbase.dll", "api-ms-win-core-processenvironment-l1-1-0.dll",
+                                  "api-ms-win-core-processenvironment-l1-2-0.dll"};
+    HMODULE mods[512];
+    DWORD bytes = 0;
+    int n = 0;
+    if (K32EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &bytes))
+        for (DWORD i = 0; i < bytes / sizeof(HMODULE); ++i) {
+            if (mods[i] == self) continue;
+            bool any = false;
+            for (const char* dll : kDlls) {
+                any |= PatchModuleImport(mods[i], dll, "GetCommandLineW", (void*)&HookGetCommandLineW);
+                any |= PatchModuleImport(mods[i], dll, "GetCommandLineA", (void*)&HookGetCommandLineA);
+            }
+            n += any;
+        }
+    Log("command line: \"%ls\" appended (GetCommandLine redirected in %d modules)", g_cfg.addArgs.c_str(), n);
+}
 
 // Called at load (DllMain): patches the exe and the DLLs of the game's folder that import cgGL.dll.
 void InstallCgGlslHooks()
