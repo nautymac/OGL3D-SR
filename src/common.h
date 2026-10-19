@@ -63,6 +63,7 @@ struct Config {
     float aspectTolerance = 0.03f;
     // [Overlay]
     bool showValues = false;      // keep separation/convergence on screen (Ctrl+F1)
+    bool cursor = true;           // SBS / TAB output: the mouse cursor is drawn into each eye (cursor.cpp)
     // [Display]
     bool dpiAware = true;         // make the game DPI aware so it renders at native resolution
     bool upscale = false;         // game stays DPI-unaware at its own resolution; we present natively (present.cpp)
@@ -135,6 +136,16 @@ void OsdMessage(const std::wstring& text, double seconds);
 void OsdStatus(const std::wstring& text);
 bool OsdActive();
 void OsdRender(GLuint fbo, int vx, int vy, int vw, int vh, int W, int H, bool compat);
+enum OverlayBlend { kBlendStraight, kBlendPremultiplied, kBlendInvert };
+void OverlayUpload(GLuint& tex, int w, int h, const uint8_t* rgba);
+bool OverlayDraw(GLuint fbo, int vx, int vy, int vw, int vh, bool compat, GLuint tex, float x0, float y0, float x1,
+                 float y1, OverlayBlend blend);
+
+// cursor.cpp
+void CursorPrepare(HWND wnd, int W, int H);   // per composed frame, before drawing
+bool CursorActive();                          // the cursor is drawn this frame
+void CursorRender(GLuint fbo, int vx, int vy, int vw, int vh, int W, int H, bool compat);
+void CursorHide(HWND wnd, bool hide);         // per composed frame: this output gets the cursor drawn in
 
 // inject.cpp
 bool InjectVertexShader(const std::string& src, std::string& out);

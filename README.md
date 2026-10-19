@@ -79,6 +79,7 @@ The main options in `OGL3D.ini`. The file itself explains every option.
 | `[Display] dpi_aware` | 1 | make a DPI-unaware game render at native resolution |
 | `[Display] virtual_backbuffer` | 1 | the game draws off-screen and the window only gets finished frames (prevents flicker) |
 | `[Overlay] show_values` | 0 | values always on screen |
+| `[Overlay] cursor` | 1 | SBS / top-and-bottom: the mouse cursor is drawn into each eye (Windows' cursor is hidden over the game) |
 
 ### Upscale mode
 

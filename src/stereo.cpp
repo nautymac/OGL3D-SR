@@ -2647,11 +2647,21 @@ bool Compose(Ctx* c, HDC dc)
         R.BlitFramebuffer(0, 0, W, H, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     };
     // The overlay goes into the composed output (never into the eye copies, which may be reused
-    // on frames the game does not draw), at the same spot in each eye's area: screen depth.
-    auto overlay = [&](GLuint fbo, std::initializer_list<std::array<int, 4>> areas) {
-        if (!OsdActive()) return;
+    // on frames the game does not draw), at the same spot in each eye's area: screen depth. So does
+    // the mouse cursor when both eyes are on screen at once (cursor: Windows' cursor would sit in
+    // neither eye's picture); woven or one eye only, Windows' cursor is where the game expects it.
+    const HWND wnd = WindowFromDC(dc);
+    CursorPrepare(wnd, W, H);
+    bool cursorOut = false;   // this frame's output has the cursor drawn in
+    auto overlay = [&](GLuint fbo, std::initializer_list<std::array<int, 4>> areas, bool cursor) {
+        cursorOut |= cursor;
+        cursor = cursor && CursorActive();
+        if (!OsdActive() && !cursor) return;
         GlStateGuard guard(c);
-        for (const auto& a : areas) OsdRender(fbo, a[0], a[1], a[2], a[3], W, H, c->compat);
+        for (const auto& a : areas) {
+            OsdRender(fbo, a[0], a[1], a[2], a[3], W, H, c->compat);
+            if (cursor) CursorRender(fbo, a[0], a[1], a[2], a[3], W, H, c->compat);
+        }
     };
     if (g_cfg.logLevel >= 2) {   // what the game left on at the end of the frame (changes only, first 40)
         static std::string lastState;
@@ -2678,15 +2688,16 @@ bool Compose(Ctx* c, HDC dc)
         R.BindFramebuffer(GL_DRAW_FRAMEBUFFER, c->sbsFbo);
         blit(left, 0, 0, W, H);
         blit(right, W, 0, 2 * W, H);
-        overlay(c->sbsFbo, {{0, 0, W, H}, {W, 0, W, H}});
-        presented = PresentFrame(WindowFromDC(dc), c->sbsFbo, W, H, g_cfg.output == 4 && !g_weaveOff);
+        const bool weave = g_cfg.output == 4 && !g_weaveOff;
+        overlay(c->sbsFbo, {{0, 0, W, H}, {W, 0, W, H}}, !weave && g_cfg.output != 2 && g_cfg.output != 3);
+        presented = PresentFrame(wnd, c->sbsFbo, W, H, weave);
         if (!presented && g_cfg.output == 4) SrSetLens(false);
     } else if (g_cfg.output == 4 && !g_weaveOff && SrAvailableOwn(WindowFromDC(dc))) {
         EnsureSbs(c);
         R.BindFramebuffer(GL_DRAW_FRAMEBUFFER, c->sbsFbo);
         blit(left, 0, 0, W, H);
         blit(right, W, 0, 2 * W, H);
-        overlay(c->sbsFbo, {{0, 0, W, H}, {W, 0, W, H}});
+        overlay(c->sbsFbo, {{0, 0, W, H}, {W, 0, W, H}}, false);
         {
             GlStateGuard guard(c);
             R.Viewport(0, 0, W, H);
@@ -2707,23 +2718,24 @@ bool Compose(Ctx* c, HDC dc)
         case 1:   // top-and-bottom, left eye on top (GL origin is bottom-left)
             blit(left, 0, H / 2, W, H);
             blit(right, 0, 0, W, H / 2);
-            overlay(0, {{0, H / 2, W, H - H / 2}, {0, 0, W, H / 2}});
+            overlay(0, {{0, H / 2, W, H - H / 2}, {0, 0, W, H / 2}}, true);
             break;
         case 2:
             blit(left, 0, 0, W, H);
-            overlay(0, {{0, 0, W, H}});
+            overlay(0, {{0, 0, W, H}}, false);
             break;
         case 3:
             blit(right, 0, 0, W, H);
-            overlay(0, {{0, 0, W, H}});
+            overlay(0, {{0, 0, W, H}}, false);
             break;
         default:         // half SBS (also the fallback when SR is unavailable)
             blit(left, 0, 0, W / 2, H);
             blit(right, W / 2, 0, W, H);
-            overlay(0, {{0, 0, W / 2, H}, {W / 2, 0, W - W / 2, H}});
+            overlay(0, {{0, 0, W / 2, H}, {W / 2, 0, W - W / 2, H}}, true);
             break;
         }
     }
+    CursorHide(wnd, cursorOut);
     if (stereo && !g_cfg.flatEnable) AutoConvergenceStep(c);   // flat depth has no view depth to converge on
     ProbeStep(c);
     if (g_cfg.virtualBackbuffer) EnsureVbb(c);   // the game's next frame goes there

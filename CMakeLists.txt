@@ -38,6 +38,7 @@ add_library(OGL3D SHARED
     src/inject.cpp
     src/srout.cpp
     src/osd.cpp
+    src/cursor.cpp
     src/present.cpp
     src/cghook.cpp
     ${OGL3D_FORWARD}

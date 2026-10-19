@@ -198,6 +198,7 @@ void LoadConfig()
     c.keyHuntMode = ParseKey(IniStr(L"Keys", L"hunt_mode", L""), c.keyHuntMode);
     c.swallowKeys = IniInt(L"Keys", L"swallow", c.swallowKeys) != 0;
     c.showValues = IniInt(L"Overlay", L"show_values", c.showValues) != 0;
+    c.cursor = IniInt(L"Overlay", L"cursor", c.cursor) != 0;
     c.dpiAware = IniInt(L"Display", L"dpi_aware", c.dpiAware) != 0;
     c.upscale = IniInt(L"Display", L"upscale", c.upscale) != 0;
     c.upscaleReportMode = IniInt(L"Display", L"upscale_report_mode", c.upscaleReportMode) != 0;

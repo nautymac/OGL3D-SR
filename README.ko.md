@@ -79,6 +79,7 @@ OpenGL 게임인지는 exe가 `opengl32.dll`을 가져오는지, 또는 게임 �
 | `[Display] dpi_aware` | 1 | DPI를 인식하지 못하는 게임을 기본 해상도로 그리게 함 |
 | `[Display] virtual_backbuffer` | 1 | 게임은 화면 밖 버퍼에 그리고, 창에는 완성된 프레임만 보냄(깜빡임 방지) |
 | `[Overlay] show_values` | 0 | 값을 항상 화면에 표시 |
+| `[Overlay] cursor` | 1 | SBS·위아래 출력에서 마우스 커서를 두 눈에 그림(게임 창 위의 Windows 커서는 숨김) |
 
 ### 업스케일 모드
 
