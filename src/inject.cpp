@@ -322,7 +322,7 @@ layout(triangles) in;
 layout(triangle_strip, max_vertices = 3) out;
 uniform vec4 s3d_P; // x = eye, y = separation
 uniform vec4 s3d_F; // x = 1 feet rule, 2 order rule, y = depth at the top of the screen, z = plane width (NDC), w = depth on the screen plane
-uniform vec4 s3d_D; // x = 1: this draw stays at screen depth; feet rule: y = nearest sprite depth, z = plane height (NDC), w = height that makes a plane whatever the width (0 = off); order rule: y = depth slot of the group, z = primitives in the draw, w = group depth
+uniform vec4 s3d_D; // x = 1: this draw stays at screen depth, 2: a lit sprite (at the screen only over the whole screen); feet rule: y = nearest sprite depth, z = plane height (NDC), w = height that makes a plane whatever the width (0 = off); order rule: y = depth slot of the group, z = primitives in the draw, w = group depth
 )";
     for (const VsOutput& o : vs.outs) {
         std::string q = o.quals;
@@ -360,6 +360,10 @@ void main()
         else
             s3d_d = vec3(max(s3d_t(s3d_lo.y), s3d_D.y));                        // sprite: stands at its bottom edge
         s3d_sh = s3d_k * s3d_d;
+        // x = 2: a lit sprite (it reads the screen's light texture) - but a primitive over the whole
+        // screen is a post-processing pass, which stays at the screen
+        if (s3d_D.x > 1.5 && all(lessThanEqual(s3d_lo, vec2(-0.99))) && all(greaterThanEqual(s3d_hi, vec2(0.99))))
+            s3d_sh = vec3(0.0);
     }
     for (int s3d_i = 0; s3d_i < 3; ++s3d_i) {
         gl_Position = gl_in[s3d_i].gl_Position;

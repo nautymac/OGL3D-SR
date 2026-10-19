@@ -335,6 +335,8 @@ constexpr int kMaxUnits = 32;
     X(void, TexStorage2D, (GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h))        \
     X(void, TexImage2DMultisample, (GLenum target, GLsizei samples, GLenum ifmt, GLsizei w,          \
                                     GLsizei h, GLboolean fixed))                                     \
+    X(void, TexStorage2DMultisample, (GLenum target, GLsizei samples, GLenum ifmt, GLsizei w,        \
+                                      GLsizei h, GLboolean fixed))                                   \
     X(void, ShaderSource, (GLuint sh, GLsizei count, const GLchar* const* str, const GLint* len))    \
     X(void, GetShaderiv, (GLuint sh, GLenum pname, GLint* v))                                        \
     X(GLuint, CreateShader, (GLenum type))                                                           \

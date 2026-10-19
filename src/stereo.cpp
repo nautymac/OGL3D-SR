@@ -180,6 +180,7 @@ struct Ctx {
     float orderDepth = 0.0f;  // of the draw being issued
     float orderSlot = 0.0f;   // depth between neighbouring groups
     float drawPrims = 0.0f;   // triangles in the draw being issued (0 = unknown)
+    bool litRedraw = false;   // the draw being issued is a lit sprite: it reads a stereo target but keeps a depth
     std::vector<FlatEv> flatEvents;                    // this frame's draws
     struct FfBox {                                     // a fixed-function draw's extent (NDC) and layer
         GLuint fb;
@@ -402,7 +403,11 @@ bool QueryTex(Ctx* c, GLuint id, GLenum target, TexInfo& ti)
     R.GetTexLevelParameteriv(target, 0, GL_TEXTURE_WIDTH, &w);
     R.GetTexLevelParameteriv(target, 0, GL_TEXTURE_HEIGHT, &h);
     R.GetTexLevelParameteriv(target, 0, GL_TEXTURE_INTERNAL_FORMAT, &f);
-    if (target == GL_TEXTURE_2D_MULTISAMPLE) R.GetTexLevelParameteriv(target, 0, GL_TEXTURE_SAMPLES, &s);
+    GLint fixed = 1;
+    if (target == GL_TEXTURE_2D_MULTISAMPLE) {
+        R.GetTexLevelParameteriv(target, 0, GL_TEXTURE_SAMPLES, &s);
+        R.GetTexLevelParameteriv(target, 0, GL_TEXTURE_FIXED_SAMPLE_LOCATIONS, &fixed);
+    }
     GLint imm = 0, immLevels = 0;
     if (target != GL_TEXTURE_2D_MULTISAMPLE) {
         R.GetTexParameteriv(target, GL_TEXTURE_IMMUTABLE_FORMAT, &imm);
@@ -415,6 +420,7 @@ bool QueryTex(Ctx* c, GLuint id, GLenum target, TexInfo& ti)
     ti.h = h;
     ti.ifmt = (GLenum)f;
     ti.samples = s;
+    ti.fixedLoc = fixed != 0;
     ti.immutable = imm != 0;
     if (imm && immLevels > 0) ti.levels = immLevels;
     if (IsDepthFormat(ti.ifmt)) ti.fmt = GL_DEPTH_COMPONENT, ti.type = GL_FLOAT;
@@ -478,7 +484,11 @@ GLuint TexClone(Ctx* c, GLuint id, GLenum targetHint)
     GLuint clone = 0;
     R.GenTextures(1, &clone);
     R.BindTexture(ti->target, clone);
-    if (ti->immutable && R.TexStorage2D) R.TexStorage2D(ti->target, ti->levels, ti->ifmt, ti->w, ti->h);
+    // immutable like the original, since only immutable storage can have texture views (WineD3D views
+    // of multisample targets in Snufkin)
+    if (ti->immutable && !sampled && R.TexStorage2DMultisample)
+        R.TexStorage2DMultisample(ti->target, ti->samples, ti->ifmt, ti->w, ti->h, ti->fixedLoc);
+    else if (ti->immutable && sampled && R.TexStorage2D) R.TexStorage2D(ti->target, ti->levels, ti->ifmt, ti->w, ti->h);
     else AllocTexLevels(*ti, 0);
     if (sampled)
         for (int i = 0; i < 8; ++i) R.TexParameteri(ti->target, kParams[i], values[i]);
@@ -1063,8 +1073,11 @@ void OrderDepthForDraw(Ctx* c)
         for (int k = 0; k < nfb; ++k) {
             const GLuint fb = fbs[k];
             if (fb == c->drawFb) continue;
-            if (ev.nsrc < 4 && std::find(ev.src, ev.src + ev.nsrc, fb) == ev.src + ev.nsrc) ev.src[ev.nsrc++] = fb;
             FboInfo& f = c->fbo[fb];
+            // a strip is a lookup table, not a layer cache (Blade Assault's Unity colour grading renders a
+            // 1024x32 one every frame: made stereo, it was shifted in the right eye and turned its colours red)
+            if (f.w > 0 && f.h > 0 && std::max(f.w, f.h) > 4 * std::min(f.w, f.h)) continue;
+            if (ev.nsrc < 4 && std::find(ev.src, ev.src + ev.nsrc, fb) == ev.src + ev.nsrc) ev.src[ev.nsrc++] = fb;
             // only a target drawn into in this frame is a layer cache: WineD3D also attaches ordinary
             // textures (sprite atlases) to its own framebuffers to upload or clear them
             if (toStereo && !f.promoted && !f.stereo &&
@@ -1075,9 +1088,39 @@ void OrderDepthForDraw(Ctx* c)
             }
         }
     }
-    if (SamplesStereoTarget(c)) {   // composite pass: stays at the screen
-        c->flatEvents.push_back(ev);
-        return;
+    if (SamplesStereoTarget(c)) {
+        // A composite pass stays at the screen - but a lit sprite reads the screen's light texture too
+        // (Blade Assault's Unity 2D lighting): it also draws a picture of its own, an ordinary texture
+        // that is not a strip (colour lookup tables are). The geometry shader keeps a primitive over the
+        // whole screen (a post-processing pass with such a texture) at the screen.
+        GLuint pic = 0;
+        for (int u = 0; u <= c->maxUnit && c->program && !pic; ++u) {
+            const GLuint id = c->bound[u][kSlot2D];
+            TexInfo* ti = id && UnitIn(units, u) ? FindTex(id) : nullptr;
+            if (!ti || ti->right || ti->w < 64 || ti->h < 64 || std::max(ti->w, ti->h) > 4 * std::min(ti->w, ti->h)) continue;
+            TexInfo* oi = ti->viewOf ? FindTex(ti->viewOf) : nullptr;
+            if (!oi || !oi->right) pic = id;
+        }
+        if (!pic) {   // composite pass
+            c->flatEvents.push_back(ev);
+            return;
+        }
+        c->litRedraw = true;
+        // a redraw of a layer drawn before into this target with that picture keeps the layer's depth
+        // (each sprite is drawn unlit, then again lit)
+        for (size_t i = c->flatEvents.size(); i-- > 0;) {
+            const FlatEv& e = c->flatEvents[i];
+            if (e.fb != c->drawFb || !e.key || e.tex != pic) continue;
+            auto kd = c->keyDepth.find(e.key);
+            if (kd == c->keyDepth.end()) break;
+            c->orderDepth = kd->second.depth;
+            c->orderSlot = 0.0f;
+            if (g_traceNow) Log("T %u.%u lit redraw of the layer drawn with texture %u: depth %.3f", g_frame, g_traceDraw, pic, c->orderDepth);
+            c->flatEvents.push_back(ev);
+            return;
+        }
+        ev.tex = pic;   // a lit sprite of its own: a group like any sprite
+        if (g_traceNow) Log("T %u.%u lit sprite (texture %u)", g_frame, g_traceDraw, pic);
     }
     // fixed-function and ARB draws have no GLSL program; the salt keeps an untextured one's key from being 0 (no layer)
     const uint64_t prog = c->program ? c->program : c->arbActive ? 0x80000000u | c->arbVp : 0;
@@ -1316,6 +1359,13 @@ bool SamplesStereoTarget(Ctx* c)
     return false;
 }
 
+// screen depth: later batches (UI), and passes that read a stereo render target (the scene already
+// drawn per eye being composited or post-processed) - not a lit redraw of a layer
+bool StaysAtScreen(Ctx* c)
+{
+    return (g_cfg.flatScreenBatch > 0 && c->batch >= g_cfg.flatScreenBatch) || (!c->litRedraw && SamplesStereoTarget(c));
+}
+
 void EyeBegin(Ctx* c, float eye, EyeState& st)
 {
     st.matrix = false;
@@ -1336,15 +1386,14 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
                 pi->lastD[0] = NAN;
                 pi->lastS = NAN;
             }
-            // screen depth: later batches (UI), and passes that read a stereo render target (the
-            // scene already drawn per eye being composited or post-processed)
-            float d = (g_cfg.flatScreenBatch > 0 && c->batch >= g_cfg.flatScreenBatch) || SamplesStereoTarget(c) ? 1.0f : 0.0f;
+            const bool screen = StaysAtScreen(c);
+            float d = screen ? 1.0f : c->litRedraw ? 2.0f : 0.0f;
             const bool order = g_cfg.flatRule == 1;
             float w = order ? c->orderDepth * g_cfg.flatTop - g_cfg.flatZero : 0.0f;
             // order rule: a draw spreads over 80% of its group's slot, so groups never overlap
             float slot = order ? c->orderSlot * g_cfg.flatTop * 0.8f : 0.0f;
             float scale = 1.0f;
-            if (d == 0.0f && order && c->drawFb) {
+            if (!screen && order && c->drawFb) {
                 auto f = c->fbo.find(c->drawFb);
                 if (f != c->fbo.end() && f->second.promoted) {
                     // layer cache: its offset is scaled to the part of it that fills the screen (the
@@ -1374,7 +1423,7 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
                 // silhouette depth: dark pixels of the picture sit silhouette_depth nearer than the
                 // picture, as a shift in pixels of the target (NDC offset * half the viewport width)
                 float s = 0.0f;
-                if (d == 0.0f && eye != 0.0f) {
+                if (!screen && eye != 0.0f) {
                     GLint vp[4] = {};
                     R.GetIntegerv(GL_VIEWPORT, vp);
                     s = -eye * SepValue() * g_cfg.silDepth * g_cfg.flatTop * scale * (float)vp[2] * 0.5f;
@@ -1396,8 +1445,7 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
         float flat = 0.0f;
         if (eye != 0.0f) {
             if (g_cfg.flatEnable && g_cfg.flatRule == 1) {
-                const bool screen = (g_cfg.flatScreenBatch > 0 && c->batch >= g_cfg.flatScreenBatch) || SamplesStereoTarget(c);
-                if (!screen) flat = a * ((c->orderDepth + c->orderSlot * 0.4f) * g_cfg.flatTop - g_cfg.flatZero);
+                if (!StaysAtScreen(c)) flat = a * ((c->orderDepth + c->orderSlot * 0.4f) * g_cfg.flatTop - g_cfg.flatZero);
             } else if (!g_cfg.monoW1) {
                 flat = a * (1.0f - g_cfg.convergence);
             }
@@ -1415,7 +1463,7 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
         // x shift per w (no per-sprite spread: there is no geometry shader on this path); feet rule: the
         // object's depth, or the floor's slope (shift grows with clip y)
         const bool flat = !c->program && g_cfg.flatEnable && c->isMain;
-        if (flat && g_cfg.flatRule == 1 && !((g_cfg.flatScreenBatch > 0 && c->batch >= g_cfg.flatScreenBatch) || SamplesStereoTarget(c)))
+        if (flat && g_cfg.flatRule == 1 && !StaysAtScreen(c))
             shift = s * ((c->orderDepth + c->orderSlot * 0.4f) * g_cfg.flatTop - g_cfg.flatZero);
         else if (flat && g_cfg.flatRule == 0 && c->ffKind == 1)
             shift = s * c->ffDepth;
@@ -1523,6 +1571,7 @@ void StereoDraw(F&& draw)
     // order depth for the draws that can take it: GLSL with our geometry shader, rewritten ARB programs, and
     // fixed-function draws (their orthographic projection gets the offset)
     const bool fixedFn = !c->program && !c->arbActive && c->compat && g_cfg.fixedFunction;
+    c->litRedraw = false;
     if (((pi && pi->gs) || ((c->arbActive || fixedFn) && g_cfg.flatEnable)) && g_cfg.flatRule == 1 && c->isMain) OrderDepthForDraw(c);
     else if (fixedFn && g_cfg.flatEnable && g_cfg.flatRule == 0 && c->isMain) FeetDepthForDraw(c);
     if (pi && pi->gs && t_drawMode != GL_TRIANGLES && t_drawMode != GL_TRIANGLE_STRIP && t_drawMode != GL_TRIANGLE_FAN) {
@@ -3518,6 +3567,7 @@ void GLAPIENTRY H_TextureView(GLuint tex, GLenum target, GLuint orig, GLenum ifm
         if (!QueryTex(c, orig, target, q)) return;
         oi = &(g_tex[orig] = q);
     }
+    oi->immutable = true;   // glTextureView takes only immutable storage; its right clone must be too
     TexInfo v;
     v.target = target;
     v.w = std::max(1, oi->w >> minLevel);
@@ -3615,6 +3665,27 @@ void GLAPIENTRY H_TexImage2DMultisample(GLenum target, GLsizei samples, GLenum i
         R.TexImage2DMultisample(target, samples, ifmt, w, h, fixed);
         R.BindTexture(target, c->bound[c->activeUnit][slot]);
     }
+    BumpStamp();
+}
+
+void GLAPIENTRY H_TexStorage2DMultisample(GLenum target, GLsizei samples, GLenum ifmt, GLsizei w, GLsizei h,
+                                          GLboolean fixed)
+{
+    R.TexStorage2DMultisample(target, samples, ifmt, w, h, fixed);
+    CTX_OR_RETURN((void)0);
+    int slot = SlotOf(target);
+    if (slot < 0 || !c->bound[c->activeUnit][slot]) return;
+    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    TexInfo& ti = g_tex[c->bound[c->activeUnit][slot]];
+    DeleteTexClone(ti);
+    ti = TexInfo{};
+    ti.target = target;
+    ti.w = w;
+    ti.h = h;
+    ti.ifmt = ifmt;
+    ti.samples = samples;
+    ti.fixedLoc = fixed;
+    ti.immutable = true;
     BumpStamp();
 }
 
@@ -4282,6 +4353,7 @@ const HookEntry kHooks[] = {
     HOOK("glTextureView", H_TextureView, TextureView),
     HOOK("glCopyImageSubData", H_CopyImageSubData, CopyImageSubData),
     HOOK("glTexImage2DMultisample", H_TexImage2DMultisample, TexImage2DMultisample),
+    HOOK("glTexStorage2DMultisample", H_TexStorage2DMultisample, TexStorage2DMultisample),
     HOOK("glShaderSource", H_ShaderSource, ShaderSource),
     HOOK("glShaderSourceARB", H_ShaderSource, ShaderSource),
     HOOK("glCompileShader", H_CompileShader, CompileShader),
