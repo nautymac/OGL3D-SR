@@ -7,6 +7,7 @@
 // The SR runtime DLLs are delay-loaded from the SR Platform folders, so the wrapper still works
 // (as plain SBS) on PCs without SR.
 #include "common.h"
+#include <atomic>
 #include <delayimp.h>
 #include <exception>
 
@@ -73,6 +74,54 @@ int DelayLoadFilter(unsigned code)
                : EXCEPTION_CONTINUE_SEARCH;
 }
 
+#ifndef _WIN64
+// The 32-bit SR runtime (DimencoWeaving32.dll, run while a weaver is created) checks for Microsoft Virtual PC by
+// executing the "vpcext" instruction 0F 3F 07 0B under its own SEH frame: on a real PC it faults with an illegal
+// instruction and the DLL's handler sets EBX = -1 ("not Virtual PC") and skips the four bytes. A game runtime with a
+// vectored exception handler (Mono in 32-bit Unity games) sees the fault first, takes it for a crash and never comes
+// back: the game hangs or dies (found with geo-11 SRWeave in Absolute Drift, Unity 2017.4 x86). This handler sits in
+// front of the game's and does what the DLL's own handler does, for that one instruction only.
+std::atomic<int> g_vpcProbes{0};
+
+LONG CALLBACK VpcProbeHandler(EXCEPTION_POINTERS* ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
+    const unsigned char* ip = (const unsigned char*)(ULONG_PTR)ep->ContextRecord->Eip;
+    __try {
+        if (ip[0] != 0x0F || ip[1] != 0x3F || ip[2] != 0x07 || ip[3] != 0x0B) return EXCEPTION_CONTINUE_SEARCH;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    ep->ContextRecord->Ebx = 0xFFFFFFFF;
+    ep->ContextRecord->Eip += 4;
+    g_vpcProbes++;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+#endif
+
+// installed at the first SR call (the game's own handlers are registered by then)
+void InstallVpcProbeHandler()
+{
+#ifndef _WIN64
+    static bool done = false;
+    if (done) return;
+    done = true;
+    AddVectoredExceptionHandler(1, VpcProbeHandler);
+#endif
+}
+
+void LogVpcProbes()
+{
+#ifndef _WIN64
+    static int logged = 0;
+    int n = g_vpcProbes.load();
+    if (n != logged) {
+        logged = n;
+        Log("SR runtime Virtual PC probe (illegal instruction 0F 3F 07 0B) answered ahead of the game's exception handlers (%d so far)", n);
+    }
+#endif
+}
+
 void DoCreateContext(SR::SRContext** out) { *out = SR::SRContext::create(); }
 
 bool CreateContextSEH(SR::SRContext** out)
@@ -120,6 +169,7 @@ bool EnsureContext()
     if (now - g.lastTry < 2000) return false;   // don't hammer the service from the render thread
     g.lastTry = now;
     g.tries++;
+    InstallVpcProbeHandler();
     try {
         if (!CreateContextSEH(&g.ctx)) {
             Log("SR runtime DLLs not found - SR output unavailable, using SBS");
@@ -193,6 +243,7 @@ bool EnsureWeaver(HWND hwnd)
     } catch (...) {
     }
     g.hwnd = hwnd;
+    LogVpcProbes();
     Log("SR OpenGL weaver created (hwnd %p, latency %d frames)", hwnd, g_cfg.srLatencyFrames);
     FinishInit();
     return !g.dead;
@@ -289,6 +340,7 @@ bool SrAvailableDx11(HWND hwnd, ID3D11DeviceContext* dctx)
     } catch (...) {
         g.dxWeaver = nullptr;
     }
+    LogVpcProbes();
     if (!loaded || code != WeaverErrorCode::WeaverSuccess || !g.dxWeaver) {
         Log("CreateDX11Weaver failed (code %d%s) - SR output unavailable", (int)code, loaded ? "" : ", DLL not found");
         g.dxWeaver = nullptr;
