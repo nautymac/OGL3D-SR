@@ -103,6 +103,7 @@ std::wstring IniPath();
 void LoadConfig();
 void SaveStereoValues();          // [Stereo] separation/convergence and [ShaderOverride]
 void SaveAutoStart(float conv);   // [Stereo] auto_start
+void IniWrittenByUs();            // after our own save: the ini watcher does not re-read it
 const wchar_t* ModeName(int mode);
 bool KoreanUi();                  // overlay language follows the Windows UI language
 

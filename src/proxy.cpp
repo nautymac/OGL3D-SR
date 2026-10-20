@@ -260,6 +260,7 @@ void SaveAutoStart(float conv)
     swprintf_s(buf, L"%.4g", conv);
     WritePrivateProfileStringW(L"Stereo", L"auto_start", buf, IniPath().c_str());
     g_cfg.autoStart = conv;
+    IniWrittenByUs();
 }
 
 void SaveStereoValues()
@@ -284,6 +285,7 @@ void SaveStereoValues()
     }
     sec += L'\0';
     WritePrivateProfileSectionW(L"ShaderOverride", sec.c_str(), IniPath().c_str());
+    IniWrittenByUs();
     Log("saved separation=%.2f convergence=%.4f, %zu shader overrides", g_cfg.separation, g_cfg.convergence,
         g_cfg.overrides.size());
 }

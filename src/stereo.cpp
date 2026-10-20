@@ -4586,29 +4586,37 @@ DWORD WINAPI HangWatch(void*)
 
 }   // namespace
 
+static FILETIME g_iniTime;   // OGL3D.ini's write time when it was last read or written by us
+
+// Our own save (Ctrl+F7, auto_start): the file holds the values already in use, so it is not re-read.
+void IniWrittenByUs()
+{
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExW(IniPath().c_str(), GetFileExInfoStandard, &fa)) g_iniTime = fa.ftLastWriteTime;
+}
+
 // OGL3D.ini edited while the game runs (tuning without restarting): re-read it. Checked about once
-// a second; our own saves (Ctrl+F7, auto_start) reload the same values.
+// a second; logged only (auto convergence saves auto_start every few seconds while it moves, and an
+// on-screen notice for that was noise).
 void ReloadConfigIfChanged()
 {
-    static FILETIME last;
     static DWORD lastCheck;
     DWORD now = GetTickCount();
     if (now - lastCheck < 1000) return;
     lastCheck = now;
     WIN32_FILE_ATTRIBUTE_DATA fa;
     if (!GetFileAttributesExW(IniPath().c_str(), GetFileExInfoStandard, &fa)) return;
-    if (!last.dwLowDateTime && !last.dwHighDateTime) {
-        last = fa.ftLastWriteTime;
+    if (!g_iniTime.dwLowDateTime && !g_iniTime.dwHighDateTime) {
+        g_iniTime = fa.ftLastWriteTime;
         return;
     }
-    if (CompareFileTime(&fa.ftLastWriteTime, &last) == 0) return;
-    last = fa.ftLastWriteTime;
+    if (CompareFileTime(&fa.ftLastWriteTime, &g_iniTime) == 0) return;
+    g_iniTime = fa.ftLastWriteTime;
     Sleep(50);   // let the editor finish writing
     LoadConfig();
     g_paramVer++;
     for (auto& kv : g_ctx) kv.second->keyDepth.clear();
     Log("OGL3D.ini changed - settings reloaded");
-    OsdMessage(KoreanUi() ? L"설정 다시 읽음 (OGL3D.ini)" : L"Settings reloaded (OGL3D.ini)", 2.0);
 }
 
 bool OnSwapBuffers(HDC dc)
