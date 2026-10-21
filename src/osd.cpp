@@ -181,7 +181,8 @@ void OverlayUpload(GLuint& tex, int w, int h, const uint8_t* rgba)
 
 // Draws tex over the NDC rectangle (x0, y0)-(x1, y1) of viewport (vx, vy, vw, vh) of fbo, blended as
 // straight alpha, premultiplied alpha, or inverting what is below where the (premultiplied) texture
-// is white. The caller has saved GL state.
+// is white; or opaque. Rows are taken top-down: pass y0 > y1 for a framebuffer texture (bottom-up).
+// The caller has saved GL state.
 bool OverlayDraw(GLuint fbo, int vx, int vy, int vw, int vh, bool compat, GLuint tex, float x0, float y0, float x1,
                  float y1, OverlayBlend blend)
 {
@@ -201,12 +202,14 @@ bool OverlayDraw(GLuint fbo, int vx, int vy, int vw, int vh, bool compat, GLuint
         R.PolygonMode(GL_FRONT_AND_BACK, GL_FILL);
     }
     R.ColorMask(1, 1, 1, 1);
-    R.Enable(GL_BLEND);
+    if (blend == kBlendOpaque) R.Disable(GL_BLEND);
+    else R.Enable(GL_BLEND);
     if (R.BlendEquation) R.BlendEquation(GL_FUNC_ADD);
     switch (blend) {
     case kBlendStraight: R.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); break;
     case kBlendPremultiplied: R.BlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); break;
     case kBlendInvert: R.BlendFunc(GL_ONE_MINUS_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA); break;
+    case kBlendOpaque: break;
     }
     R.UseProgram(g.prog);
     R.Uniform4f(g.locRect, x0, y0, x1, y1);

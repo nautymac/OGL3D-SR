@@ -234,6 +234,7 @@ struct Ctx {
     bool vbbFailed = false;
     GLenum fb0DrawBuf = GL_BACK, fb0ReadBuf = GL_BACK;   // what the game selected for framebuffer 0
     GLuint leftSrc = 0;       // left eye of the last composed frame (vbbFbo or leftCopyFbo)
+    int fb0Samples = -1;      // samples of the window's back buffer (-1 = not read yet)
     GLuint sbsFbo = 0, sbsTex = 0;   // SR weaver input (both eyes side by side, full width each)
     int sbsW = 0, sbsH = 0;
     // Did the game render into the back buffer since the last SwapBuffers? Some games (Broken Age)
@@ -2695,6 +2696,23 @@ bool Compose(Ctx* c, HDC dc)
         R.BindFramebuffer(GL_READ_FRAMEBUFFER, src);
         R.BlitFramebuffer(0, 0, W, H, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     };
+    // A multisampled window (Rocketbirds: 4 samples) takes no blits - GL refuses them and the game's own
+    // picture stayed on screen - so the eyes are drawn into it as textured quads.
+    if (c->fb0Samples < 0) {
+        GLint samples = 0;
+        R.GetIntegerv(GL_SAMPLES, &samples);   // framebuffer 0 is bound
+        c->fb0Samples = samples;
+        if (samples > 0) Log("output drawn into the window: its back buffer is multisampled (%d samples), which takes no blits", samples);
+    }
+    auto toWindow = [&](GLuint src, int x0, int y0, int x1, int y1) {
+        const GLuint tex = src == c->leftCopyFbo ? c->leftCopyTex : src == c->vbbFbo ? c->vbbColor : src == c->rightDefFbo ? c->rightDefColor : 0;
+        if (c->fb0Samples <= 0 || !tex) {
+            blit(src, x0, y0, x1, y1);
+            return;
+        }
+        GlStateGuard guard(c);
+        OverlayDraw(0, x0, y0, x1 - x0, y1 - y0, c->compat, tex, -1.0f, 1.0f, 1.0f, -1.0f, kBlendOpaque);   // bottom-up texture
+    };
     // The overlay goes into the composed output (never into the eye copies, which may be reused
     // on frames the game does not draw), at the same spot in each eye's area: screen depth. So does
     // the mouse cursor when both eyes are on screen at once (cursor: Windows' cursor would sit in
@@ -2765,21 +2783,21 @@ bool Compose(Ctx* c, HDC dc)
         R.BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         switch (g_cfg.output) {
         case 1:   // top-and-bottom, left eye on top (GL origin is bottom-left)
-            blit(left, 0, H / 2, W, H);
-            blit(right, 0, 0, W, H / 2);
+            toWindow(left, 0, H / 2, W, H);
+            toWindow(right, 0, 0, W, H / 2);
             overlay(0, {{0, H / 2, W, H - H / 2}, {0, 0, W, H / 2}}, true);
             break;
         case 2:
-            blit(left, 0, 0, W, H);
+            toWindow(left, 0, 0, W, H);
             overlay(0, {{0, 0, W, H}}, false);
             break;
         case 3:
-            blit(right, 0, 0, W, H);
+            toWindow(right, 0, 0, W, H);
             overlay(0, {{0, 0, W, H}}, false);
             break;
         default:         // half SBS (also the fallback when SR is unavailable)
-            blit(left, 0, 0, W / 2, H);
-            blit(right, W / 2, 0, W, H);
+            toWindow(left, 0, 0, W / 2, H);
+            toWindow(right, W / 2, 0, W, H);
             overlay(0, {{0, 0, W / 2, H}, {W / 2, 0, W - W / 2, H}}, true);
             break;
         }

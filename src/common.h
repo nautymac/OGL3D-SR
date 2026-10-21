@@ -137,7 +137,7 @@ void OsdMessage(const std::wstring& text, double seconds);
 void OsdStatus(const std::wstring& text);
 bool OsdActive();
 void OsdRender(GLuint fbo, int vx, int vy, int vw, int vh, int W, int H, bool compat);
-enum OverlayBlend { kBlendStraight, kBlendPremultiplied, kBlendInvert };
+enum OverlayBlend { kBlendStraight, kBlendPremultiplied, kBlendInvert, kBlendOpaque };
 void OverlayUpload(GLuint& tex, int w, int h, const uint8_t* rgba);
 bool OverlayDraw(GLuint fbo, int vx, int vy, int vw, int vh, bool compat, GLuint tex, float x0, float y0, float x1,
                  float y1, OverlayBlend blend);
