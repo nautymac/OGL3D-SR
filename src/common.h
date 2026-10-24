@@ -108,6 +108,7 @@ const wchar_t* ModeName(int mode);
 bool KoreanUi();                  // overlay language follows the Windows UI language
 
 HMODULE RealOpenGL();             // System32 opengl32.dll
+void FixWineD3DWake();            // WineD3D's command thread woken by an event, not thread alerts
 void LoadRealExtensions();        // fills the S3D_EXT_FUNCS part of R (needs a current context)
 
 // stereo.cpp

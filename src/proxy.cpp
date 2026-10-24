@@ -374,6 +374,7 @@ BOOL WINAPI H_wglMakeCurrent(HDC dc, HGLRC rc)
 HGLRC WINAPI H_wglCreateContext(HDC dc)
 {
     RealOpenGL();
+    FixWineD3DWake();   // a WineD3D loaded after us: still before it starts its command stream thread
     HGLRC rc = R.wglCreateContext(dc);
     PIXELFORMATDESCRIPTOR pfd{};
     int pf = GetPixelFormat(dc);
@@ -492,6 +493,35 @@ static void MakeDpiAware()
                             : err == ERROR_ACCESS_DENIED ? "already set by the game" : "could not be changed");
 }
 
+// WineD3D's command stream thread sleeps in NtWaitForAlertByThreadId, and the threads queueing work
+// wake it with NtAlertThreadByThreadId (wined3d cs.c). An alert sent after a timed wait (queries
+// pending) has already returned stays pending, and since Windows 11 24H2 critical sections wait for
+// thread alerts too: the thread's next contended EnterCriticalSection (heap lock, driver lock)
+// returns at once and queues its wait block a second time, the wait list points to itself, and
+// ntdll spins in RtlpWaitOnCriticalSection forever (The Messenger: "not responding" after seconds
+// to minutes, also without this wrapper). Without these two functions WineD3D wakes the thread
+// with an event, where a leftover signal only costs one extra pass of its loop.
+static FARPROC WINAPI WineD3DGetProcAddress(HMODULE m, LPCSTR name)
+{
+    if ((ULONG_PTR)name > 0xFFFF && (!strcmp(name, "NtAlertThreadByThreadId") || !strcmp(name, "NtWaitForAlertByThreadId"))) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return nullptr;
+    }
+    return GetProcAddress(m, name);
+}
+
+void FixWineD3DWake()
+{
+    static HMODULE done;
+    HMODULE m = GetModuleHandleW(L"wined3d.dll");
+    if (!m || m == done) return;
+    done = m;
+    if (PatchModuleImport(m, "kernel32.dll", "GetProcAddress", (void*)&WineD3DGetProcAddress))
+        Log("WineD3D: command thread woken by an event (thread alerts hang Windows 11 critical sections)");
+    else
+        Log("WineD3D: GetProcAddress import not found - command thread still woken by thread alerts");
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
@@ -503,6 +533,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         LoadConfig();
         if (g_cfg.logCrashes) AddVectoredExceptionHandler(1, CrashLogger);
         if (!g_cfg.addArgs.empty()) InstallCommandLineArgs();   // before the game's startup code parses it
+        FixWineD3DWake();   // WineD3D imports us: its imports are bound, its code has not run yet
         // upscale: the game stays DPI-unaware at its own resolution (readable UI) and must not
         // switch the panel's display mode; we present at native resolution ourselves
         if (g_cfg.upscale) InstallDisplayModeHooks();
