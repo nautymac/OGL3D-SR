@@ -204,12 +204,19 @@ bool AnalyzeVertexShader(const std::string& injected, VsInfo& info, std::string&
     info = VsInfo{};
     std::string code = BlankComments(injected);
     // preprocessor lines would glue onto the next statement
+    std::vector<std::pair<std::string, std::string>> defines;   // #define name, body
     for (size_t i = 0; i < code.size(); ++i) {
         while (i < code.size() && (code[i] == ' ' || code[i] == '\t')) ++i;
         bool pp = i < code.size() && code[i] == '#';
         if (pp && code.compare(i, 8, "#version") == 0) {
             info.version = atoi(code.c_str() + i + 8);
             info.core = code.find("core", i) < code.find('\n', i);
+        }
+        if (pp) {
+            static const std::regex defineRe(R"(^#\s*define\s+(\w+)\s+(.*)$)");
+            std::string line = code.substr(i, code.find('\n', i) - i);
+            std::smatch m;
+            if (std::regex_match(line, m, defineRe)) defines.push_back({m[1].str(), m[2].str()});
         }
         while (i < code.size() && code[i] != '\n') {
             if (pp) code[i] = ' ';
@@ -283,7 +290,12 @@ bool AnalyzeVertexShader(const std::string& injected, VsInfo& info, std::string&
             start = i + 1;
         }
     }
-    auto uses = [&](const char* name) { return std::regex_search(code, std::regex(std::string(R"(\b)") + name + R"(\b)")); };
+    // built-in outputs written through a macro (MojoShader, FNA: "#define vs_oT0 gl_TexCoord[0]"): the
+    // bodies of the macros the code uses count as code
+    std::string scan = code;
+    for (const auto& d : defines)
+        if (std::regex_search(code, std::regex(R"(\b)" + d.first + R"(\b)"))) scan += "\n" + d.second;
+    auto uses = [&](const char* name) { return std::regex_search(scan, std::regex(std::string(R"(\b)") + name + R"(\b)")); };
     if (uses("gl_FrontColor")) info.builtins |= kBiFrontColor;
     if (uses("gl_BackColor")) info.builtins |= kBiBackColor;
     if (uses("gl_FrontSecondaryColor")) info.builtins |= kBiFrontSecondary;
@@ -292,10 +304,10 @@ bool AnalyzeVertexShader(const std::string& injected, VsInfo& info, std::string&
     if (uses("gl_ClipVertex")) info.builtins |= kBiClipVertex;
     if (uses("gl_PointSize")) info.builtins |= kBiPointSize;
     bool dyn = false;
-    info.texCoords = MaxLiteralIndex(code, "gl_TexCoord", dyn) + 1;
+    info.texCoords = MaxLiteralIndex(scan, "gl_TexCoord", dyn) + 1;
     if (dyn) info.texCoords = 8;
     dyn = false;
-    info.clipDistances = MaxLiteralIndex(code, "gl_ClipDistance", dyn) + 1;
+    info.clipDistances = MaxLiteralIndex(scan, "gl_ClipDistance", dyn) + 1;
     if (dyn) info.clipDistances = 8;
     if (info.core && (info.builtins & ~kBiPointSize)) info.core = false;
 
@@ -323,6 +335,7 @@ layout(triangle_strip, max_vertices = 3) out;
 uniform vec4 s3d_P; // x = eye, y = separation
 uniform vec4 s3d_F; // x = 1 feet rule, 2 order rule, y = depth at the top of the screen, z = plane width (NDC), w = depth on the screen plane
 uniform vec4 s3d_D; // x = 1: this draw stays at screen depth, 2: a lit sprite (at the screen only over the whole screen); feet rule: y = nearest sprite depth, z = plane height (NDC), w = height that makes a plane whatever the width (0 = off); order rule: y = depth slot of the group, z = primitives in the draw, w = group depth
+uniform vec4 s3d_X; // x = pixels of the target per NDC unit to round the shift to ([Flat] snap_pixels; 0 = off)
 )";
     for (const VsOutput& o : vs.outs) {
         std::string q = o.quals;
@@ -364,6 +377,10 @@ void main()
         // screen is a post-processing pass, which stays at the screen
         if (s3d_D.x > 1.5 && all(lessThanEqual(s3d_lo, vec2(-0.99))) && all(greaterThanEqual(s3d_hi, vec2(0.99))))
             s3d_sh = vec3(0.0);
+        // snap_pixels: whole pixels of the target, so both eyes round a sprite at a fractional position the
+        // same way (in a low-resolution target its disparity otherwise flips by a pixel while it scrolls)
+        if (s3d_X.x > 0.0)
+            s3d_sh = round(s3d_sh * s3d_X.x) / s3d_X.x;
     }
     for (int s3d_i = 0; s3d_i < 3; ++s3d_i) {
         gl_Position = gl_in[s3d_i].gl_Position;

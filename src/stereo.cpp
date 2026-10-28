@@ -90,6 +90,8 @@ struct ProgInfo {
     GLint locF = -1, locD = -1;
     unsigned fVer = 0;
     float lastD[4] = {NAN, NAN, NAN, NAN};   // s3d_D last written
+    GLint locX = -1;          // s3d_X: pixels per NDC unit the shift is rounded to ([Flat] snap_pixels)
+    float lastX = NAN;
     GLint locS = -1;          // s3d_S: silhouette depth in the fragment shader ([Flat] silhouette)
     float lastS = NAN;
     // texture units its samplers read (SampledUnits); read once at its first draw, after the engine
@@ -164,7 +166,7 @@ struct Ctx {
     // scissor/viewport batches of the current frame (flat depth: later batches are UI)
     int batch = 0;
     unsigned drawsInBatch = 0;
-    GLuint batchFb = 0;       // framebuffer the current batch draws into
+    uint64_t batchTarget = 0; // render target the current batch draws into (DrawTarget)
     bool batchPending = false;
     // flat depth, rule = order: groups of consecutive draws with one program, in drawing order
     uint64_t groupId = 0;             // (program, texture) of the current group
@@ -214,8 +216,14 @@ struct Ctx {
     std::vector<FfObj> ffObjects;
     std::vector<std::array<float, 4>> ffOverlays;      // later screen-wide pictures (UI): what lies in them stays there
     std::unordered_map<GLuint, GLuint> texCopiedFrom;  // texture -> texture last glCopyImageSubData'd into it
+    // render targets for the composition order (LayoutTarget)
+    std::unordered_map<GLuint, uint32_t> fbFirstColor; // framebuffer -> its first colour attachment
+    std::unordered_map<uint64_t, GLuint> layoutTargets; // framebuffer + a later attachment -> an id of its own
+    std::unordered_map<GLuint, GLuint> texTarget;      // render texture -> the target it was drawn into as
     std::unordered_map<uint64_t, size_t> layoutPos;    // group key -> place in the last frame's composed picture
     size_t layoutCount = 0;                            // places in it (0 = far)
+    size_t layoutPeak = 0;                             // the most places lately, and the frame it was last seen
+    unsigned layoutPeakFrame = 0;
     GLuint layoutLastFb = 0;                           // target and place of the last known group drawn
     long long layoutLastG = -1;                        // in this frame (for groups new to the picture)
     // window / default framebuffer
@@ -680,6 +688,42 @@ FboInfo* BoundFbo(Ctx* c, GLenum target)
     return fb ? &c->fbo[fb] : nullptr;
 }
 
+// The render target of framebuffer fb for the composition order (ComputeLayout): the framebuffer with
+// its first colour attachment. FNA keeps one framebuffer object and swaps its attachment for every
+// render target, so an attachment other than the framebuffer's first gets an id of its own.
+GLuint LayoutTarget(Ctx* c, GLuint fb)
+{
+    auto it = fb ? c->fbo.find(fb) : c->fbo.end();
+    if (it == c->fbo.end() || !it->second.att[0].id) return fb;
+    const Att& a = it->second.att[0];
+    GLuint id = a.id;
+    if (a.kind == GL_TEXTURE) {
+        TexInfo* ti = FindTex(id);
+        if (ti && ti->viewOf) id = ti->viewOf;   // WineD3D attaches views: count the texture they view
+    }
+    const uint32_t att = (a.kind == GL_RENDERBUFFER ? 0x80000000u : 0u) | id;
+    uint32_t& first = c->fbFirstColor[fb];
+    if (!first) first = att;
+    GLuint t = fb;
+    if (att != first) {
+        GLuint& v = c->layoutTargets[(uint64_t)fb << 32 | att];
+        if (!v) v = 0x40000000u + (GLuint)c->layoutTargets.size();
+        t = v;
+    }
+    if (a.kind == GL_TEXTURE) c->texTarget[id] = t;
+    return t;
+}
+
+// What a draw renders into: the framebuffer and its first colour attachment. FNA keeps one
+// framebuffer object and swaps its attachment for every render target.
+uint64_t DrawTarget(Ctx* c)
+{
+    uint64_t t = (uint64_t)c->drawFb << 32;
+    auto it = c->drawFb ? c->fbo.find(c->drawFb) : c->fbo.end();
+    if (it != c->fbo.end()) t |= it->second.att[0].id | (it->second.att[0].kind == GL_RENDERBUFFER ? 0x80000000u : 0u);
+    return t;
+}
+
 void SetAttachment(Ctx* c, GLenum target, GLenum point, const Att& a)
 {
     FboInfo* f = BoundFbo(c, target);
@@ -1033,7 +1077,7 @@ void FeetDepthForDraw(Ctx* c)
 void OrderDepthForDraw(Ctx* c)
 {
     FlatEv ev;
-    ev.fb = c->drawFb;
+    ev.fb = LayoutTarget(c, c->drawFb);
     ev.prog = c->program;
     // the texture it draws with: engines put it on any unit (Huntdown under WineD3D keeps a 0x0
     // placeholder on unit 0 and the sprite atlas on another one); the group key takes all of them
@@ -1072,22 +1116,28 @@ void OrderDepthForDraw(Ctx* c)
             nfb = FbosOfTexture(c, t, fbs, 4);
         }
         for (int k = 0; k < nfb; ++k) {
-            const GLuint fb = fbs[k];
-            if (fb == c->drawFb) continue;
+            const GLuint fb = fbs[k], lt = LayoutTarget(c, fb);
+            if (lt == ev.fb) continue;
             FboInfo& f = c->fbo[fb];
             // a strip is a lookup table, not a layer cache (Blade Assault's Unity colour grading renders a
             // 1024x32 one every frame: made stereo, it was shifted in the right eye and turned its colours red)
             if (f.w > 0 && f.h > 0 && std::max(f.w, f.h) > 4 * std::min(f.w, f.h)) continue;
-            if (ev.nsrc < 4 && std::find(ev.src, ev.src + ev.nsrc, fb) == ev.src + ev.nsrc) ev.src[ev.nsrc++] = fb;
+            if (ev.nsrc < 4 && std::find(ev.src, ev.src + ev.nsrc, lt) == ev.src + ev.nsrc) ev.src[ev.nsrc++] = lt;
             // only a target drawn into in this frame is a layer cache: WineD3D also attaches ordinary
             // textures (sprite atlases) to its own framebuffers to upload or clear them
             if (toStereo && !f.promoted && !f.stereo &&
-                std::any_of(c->flatEvents.begin(), c->flatEvents.end(), [fb](const FlatEv& e) { return e.fb == fb && e.key; })) {
+                std::any_of(c->flatEvents.begin(), c->flatEvents.end(), [lt](const FlatEv& e) { return e.fb == lt && e.key; })) {
                 f.promoted = true;
                 f.dirty = true;
                 Log("flat depth: fbo %u (texture %u) is drawn into the stereo scene: layer cache", fb, base);
             }
         }
+        // a render target no framebuffer holds any more (FNA has moved its one framebuffer on to the
+        // next target): the target it was drawn into as
+        auto tt = nfb ? c->texTarget.end() : c->texTarget.find(base);
+        if (tt != c->texTarget.end() && tt->second != ev.fb && ti && !(ti->w > 0 && ti->h > 0 && std::max(ti->w, ti->h) > 4 * std::min(ti->w, ti->h)) &&
+            ev.nsrc < 4 && std::find(ev.src, ev.src + ev.nsrc, tt->second) == ev.src + ev.nsrc)
+            ev.src[ev.nsrc++] = tt->second;
     }
     if (SamplesStereoTarget(c)) {
         // A composite pass stays at the screen - but a lit sprite reads the screen's light texture too
@@ -1111,7 +1161,7 @@ void OrderDepthForDraw(Ctx* c)
         // (each sprite is drawn unlit, then again lit)
         for (size_t i = c->flatEvents.size(); i-- > 0;) {
             const FlatEv& e = c->flatEvents[i];
-            if (e.fb != c->drawFb || !e.key || e.tex != pic) continue;
+            if (e.fb != ev.fb || !e.key || e.tex != pic) continue;
             auto kd = c->keyDepth.find(e.key);
             if (kd == c->keyDepth.end()) break;
             c->orderDepth = kd->second.depth;
@@ -1161,15 +1211,15 @@ void OrderDepthForDraw(Ctx* c)
     if (lt != c->layoutPos.end()) {
         g = lt->second;
         n = c->layoutCount;
-        if (c->drawFb == c->layoutLastFb) c->layoutLastG = (long long)g;
-    } else if (c->layoutCount > 1 && c->drawFb == c->layoutLastFb && c->layoutLastG >= 0) {
+        if (ev.fb == c->layoutLastFb) c->layoutLastG = (long long)g;
+    } else if (c->layoutCount > 1 && ev.fb == c->layoutLastFb && c->layoutLastG >= 0) {
         // not in the last frame's picture (an animated sprite shows another frame texture): right after
         // the group drawn before it into the same target, on the same scale as the known ones
         g = (size_t)std::min<long long>(c->layoutLastG + 1, (long long)c->layoutCount - 1);
         n = c->layoutCount;
     }
-    if (lt != c->layoutPos.end() || c->drawFb != c->layoutLastFb) {
-        c->layoutLastFb = c->drawFb;
+    if (lt != c->layoutPos.end() || ev.fb != c->layoutLastFb) {
+        c->layoutLastFb = ev.fb;
         c->layoutLastG = lt != c->layoutPos.end() ? (long long)lt->second : -1;
     }
     const float t = OrderT(g, n);
@@ -1308,7 +1358,13 @@ void ComputeLayout(Ctx* c)
     WalkLayout(ev, alias, root, ev.size(), 0, order);
     const size_t n = order.size();
     for (size_t k = 0; k < n; ++k) c->layoutPos[order[k]] = k;
-    c->layoutCount = n;
+    // depth is the place among the places: a group that comes and goes (a blinking text cursor, an object
+    // scrolling into view) would move every other layer and they glide after it (Axiom Verge's tiles
+    // "swayed" while walking). The count grows at once; it shrinks by one or two only after 5 s without
+    // the peak, by more (another scene) at once.
+    if (n >= c->layoutPeak || n + 2 < c->layoutPeak || g_frame - c->layoutPeakFrame > 300) c->layoutPeak = n;
+    if (n == c->layoutPeak) c->layoutPeakFrame = g_frame;
+    c->layoutCount = c->layoutPeak;
     for (auto& a : alias) {
         auto it = c->layoutPos.find(a.second);
         if (it != c->layoutPos.end()) c->layoutPos.emplace(a.first, it->second);
@@ -1385,14 +1441,16 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
                             g_cfg.flatPlane, g_cfg.flatZero);
                 pi->fVer = g_paramVer;
                 pi->lastD[0] = NAN;
+                pi->lastX = NAN;
                 pi->lastS = NAN;
             }
             const bool screen = StaysAtScreen(c);
             float d = screen ? 1.0f : c->litRedraw ? 2.0f : 0.0f;
             const bool order = g_cfg.flatRule == 1;
             float w = order ? c->orderDepth * g_cfg.flatTop - g_cfg.flatZero : 0.0f;
-            // order rule: a draw spreads over 80% of its group's slot, so groups never overlap
-            float slot = order ? c->orderSlot * g_cfg.flatTop * 0.8f : 0.0f;
+            // order rule: a draw spreads over 80% of its group's slot, so groups never overlap - not when
+            // shifts are whole pixels: the spread is less than one and would round differently per sprite
+            float slot = order && !g_cfg.flatSnap ? c->orderSlot * g_cfg.flatTop * 0.8f : 0.0f;
             float scale = 1.0f;
             if (!screen && order && c->drawFb) {
                 auto f = c->fbo.find(c->drawFb);
@@ -1419,6 +1477,19 @@ void EyeBegin(Ctx* c, float eye, EyeState& st)
             if (memcmp(v, pi->lastD, sizeof(v)) != 0) {
                 R.Uniform4f(pi->locD, v[0], v[1], v[2], v[3]);
                 memcpy(pi->lastD, v, sizeof(v));
+            }
+            if (pi->locX >= 0) {
+                // snap_pixels: pixels of the target per NDC unit (half the viewport width)
+                float px = 0.0f;
+                if (g_cfg.flatSnap && !screen) {
+                    GLint vp[4] = {};
+                    R.GetIntegerv(GL_VIEWPORT, vp);
+                    px = (float)vp[2] * 0.5f;
+                }
+                if (px != pi->lastX) {
+                    R.Uniform4f(pi->locX, px, 0.0f, 0.0f, 0.0f);
+                    pi->lastX = px;
+                }
             }
             if (pi->locS >= 0) {
                 // silhouette depth: dark pixels of the picture sit silhouette_depth nearer than the
@@ -1560,11 +1631,12 @@ void StereoDraw(F&& draw)
     }
     if (mode == kModeSkip) return;
     if (c->isMain) {
+        const uint64_t target = DrawTarget(c);
         if (c->batchPending) {
-            if (c->drawFb == c->batchFb) c->batch++;
+            if (target == c->batchTarget) c->batch++;
             c->batchPending = false;
         }
-        c->batchFb = c->drawFb;
+        c->batchTarget = target;
         c->drawsInBatch++;
     }
     // an ARB assembly vertex program we rewrote (no GLSL program bound)
@@ -1619,7 +1691,7 @@ void StereoTargetOp(F&& op, bool color = true)
     if (c->drawFb == 0) c->fb0Touched = true;
     if (g_cfg.flatEnable && g_cfg.flatRule == 1 && c->isMain && color) {   // for scratch targets (ComputeLayout)
         FlatEv ev;
-        ev.fb = c->drawFb;
+        ev.fb = LayoutTarget(c, c->drawFb);
         ev.clear = true;
         c->flatEvents.push_back(ev);
     }
@@ -3367,6 +3439,7 @@ void GLAPIENTRY H_DeleteFramebuffers(GLsizei n, const GLuint* ids)
             if (it == c->fbo.end()) continue;
             if (it->second.right) R.DeleteFramebuffers(1, &it->second.right);
             c->fbo.erase(it);
+            c->fbFirstColor.erase(ids[i]);   // a new framebuffer may get its name
             if (c->drawFb == ids[i]) c->drawFb = 0;
             if (c->readFb == ids[i]) c->readFb = 0;
         }
@@ -3514,10 +3587,10 @@ void GLAPIENTRY H_BlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GL
     std::lock_guard<std::recursive_mutex> lk(g_lock);
     if (g_cfg.flatEnable && g_cfg.flatRule == 1 && c->isMain && (mask & GL_COLOR_BUFFER_BIT) && c->readFb != c->drawFb) {
         FlatEv ev;   // a copy of another target's picture, for the composition order (ComputeLayout)
-        ev.fb = c->drawFb;
-        ev.src[0] = c->readFb;
+        ev.fb = LayoutTarget(c, c->drawFb);
+        ev.src[0] = LayoutTarget(c, c->readFb);
         ev.nsrc = 1;
-        c->flatEvents.push_back(ev);
+        if (ev.src[0] != ev.fb) c->flatEvents.push_back(ev);
     }
     GLuint rightDraw = RightFor(c, c->drawFb);
     if (!rightDraw) return;
@@ -4058,6 +4131,7 @@ void GLAPIENTRY H_LinkProgram(GLuint prog)
         pi.locF = R.GetUniformLocation(prog, "s3d_F");
         pi.locD = R.GetUniformLocation(prog, "s3d_D");
         pi.gs = pi.locF >= 0 && pi.locD >= 0;
+        pi.locX = R.GetUniformLocation(prog, "s3d_X");
         if (!g_cfg.silhouette.empty()) pi.locS = R.GetUniformLocation(prog, "s3d_S");
     }
     pi.hash = hashes.empty() ? 0 : Fnv1a(hashes.data(), hashes.size() * sizeof(uint32_t));
@@ -4212,14 +4286,14 @@ void GLAPIENTRY H_DrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type
 void GLAPIENTRY H_DrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
                                               const void* idx, GLint base)
 {
-    t_drawMode = mode;
+    TraceDraw("DrawRangeElementsBaseVertex", mode, count);
     StereoDraw([&] { R.DrawRangeElementsBaseVertex(mode, start, end, count, type, idx, base); });
 }
 
 void GLAPIENTRY H_DrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* idx,
                                                   GLsizei inst, GLint base)
 {
-    t_drawMode = mode;
+    TraceDraw("DrawElementsInstancedBaseVertex", mode, count);
     StereoDraw([&] { R.DrawElementsInstancedBaseVertex(mode, count, type, idx, inst, base); });
 }
 
@@ -4757,8 +4831,9 @@ void WINAPI H_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void
 }
 
 // A scissor or viewport call after some draws starts a new batch (AGS: room, then UI overlays) -
-// but only within the same framebuffer. Games that render passes into different targets (Door
-// Kickers: background cache, scene, composite) reset scissor/viewport per target; those are not UI.
+// but only within the same render target. Games that render passes into different targets (Door
+// Kickers: background cache, scene, composite; FNA through one framebuffer object) reset
+// scissor/viewport per target; those are not UI.
 void NextBatch()
 {
     Ctx* c = t_ctx;

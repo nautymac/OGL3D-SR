@@ -46,6 +46,7 @@ struct Config {
     float flatCacheScale = 0.0f;  // offset scale inside off-screen layer caches (0 = auto: scissored part of the viewport)
     bool flatGroupByDraw = false; // order rule: every draw call is a layer (Unity), not a run of draws with the same program and textures
     float flatOrderCurve = 1.0f;  // order rule: depth = 1 - place^curve; < 1 gives the first (far) layers more depth
+    bool flatSnap = false;        // shift by whole pixels of the render target (low-resolution pixel games: Axiom Verge)
     // silhouette depth: in these programs' pictures, dark pixels come nearer than the picture
     std::vector<uint32_t> silhouette;   // program hashes
     std::string silUv = "texcoordOut", silTex = "texture1";   // fragment shader varying and sampler of the picture

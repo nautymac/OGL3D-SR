@@ -158,6 +158,7 @@ void LoadConfig()
     c.flatCacheScale = IniFloat(L"Flat", L"cache_scale", c.flatCacheScale);
     c.flatGroupByDraw = _wcsicmp(IniStr(L"Flat", L"group", L"texture").c_str(), L"draw") == 0;
     c.flatOrderCurve = IniFloat(L"Flat", L"order_curve", c.flatOrderCurve);
+    c.flatSnap = IniInt(L"Flat", L"snap_pixels", c.flatSnap) != 0;
     c.silhouette.clear();
     {
         std::wstring list = IniStr(L"Flat", L"silhouette", L"");
@@ -239,8 +240,8 @@ void LoadConfig()
         c.enable, c.separation, c.maxSeparation, c.convergence, c.autoConvergence ? " (auto)" : "", c.output,
         c.swapEyes, c.monoW1, c.inject, c.blockProgramBinary, c.overrides.size());
     if (c.flatEnable)
-        Log("flat depth: rule=%s top=%.2f screen=%.2f plane=%.2fx%.2f tall=%.2f sprite_min=%.2f screen_batch=%d", c.flatRule ? "order" : "feet", c.flatTop,
-            c.flatZero, c.flatPlane, c.flatPlaneHeight, c.flatPlaneTall, c.flatSpriteMin, c.flatScreenBatch);
+        Log("flat depth: rule=%s top=%.2f screen=%.2f plane=%.2fx%.2f tall=%.2f sprite_min=%.2f screen_batch=%d snap_pixels=%d", c.flatRule ? "order" : "feet", c.flatTop,
+            c.flatZero, c.flatPlane, c.flatPlaneHeight, c.flatPlaneTall, c.flatSpriteMin, c.flatScreenBatch, c.flatSnap ? 1 : 0);
 }
 
 const wchar_t* ModeName(int mode)
