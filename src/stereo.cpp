@@ -66,6 +66,7 @@ struct TexInfo {
     int levels = 1;           // mip levels the game allocated
     bool immutable = false;   // glTexStorage2D
     GLuint right = 0;         // right-eye clone
+    bool picture = false;     // the game uploads into it from the CPU (a video frame): one picture for both eyes
     // glTextureView (WineD3D's shader resource views): a view of another texture's storage; its
     // right-eye twin is the same view of that texture's clone
     GLuint viewOf = 0;
@@ -158,6 +159,14 @@ struct Ctx {
     GLuint activeUnit = 0;
     int maxUnit = 0;
     GLuint bound[kMaxUnits][kSlotCount] = {};
+    struct ImageUnit {                                 // glBindImageTexture: what a compute shader reads or writes
+        GLuint tex = 0;
+        GLint level = 0, layer = 0;
+        GLboolean layered = GL_FALSE;
+        GLenum access = 0, format = 0;                 // format 0: the texture's own (glBindImageTextures)
+    };
+    ImageUnit images[32];
+    int maxImage = -1;
     GLenum listMode = 0;      // the game's glNewList mode while it compiles a list
     GLuint arbVp = 0;         // bound ARB vertex program
     GLuint arbFp = 0;         // bound ARB fragment program
@@ -307,7 +316,8 @@ GLuint LeftSrc(const Ctx* c)
 }
 
 struct Stats {
-    unsigned stereoDraws, monoDraws, clears, blits, copies, immediate, lists, uniformSets, matrixDraws, flushes, finishes;
+    unsigned stereoDraws, monoDraws, clears, blits, copies, immediate, lists, uniformSets, matrixDraws, flushes, finishes,
+        computeRight;
 };
 
 std::recursive_mutex g_lock;
@@ -495,10 +505,11 @@ GLuint TexClone(Ctx* c, GLuint id, GLenum targetHint)
         ti = &(g_tex[id] = q);
     }
     if (ti->right) return ti->right;
+    if (ti->picture) return 0;
     if (ti->viewOf) {
         // the same view of the original's clone
         TexInfo* oi = FindTex(ti->viewOf);
-        GLuint origRight = oi ? TexClone(c, ti->viewOf, oi->target) : 0;
+        GLuint origRight = oi && !oi->picture ? TexClone(c, ti->viewOf, oi->target) : 0;
         if (!origRight || !R.TextureView) return 0;
         GLuint view = 0;
         R.GenTextures(1, &view);
@@ -665,6 +676,11 @@ GLuint RightFor(Ctx* c, GLuint fb)
     for (int i = 0; i < kAttCount && !sized; ++i)
         if (f.att[i].kind) sized = AttSize(c, f.att[i], w, h);
     bool stereo = sized && (IsStereoSize(c, w, h) || f.promoted);
+    // a picture the game uploads (video frames, converted in such a framebuffer) stays one picture
+    for (int i = 0; i < kMaxColorAttachments && stereo; ++i)
+        if (f.att[i].kind == GL_TEXTURE)
+            if (TexInfo* ti = FindTex(f.att[i].id))
+                if (ti->picture || (ti->viewOf && FindTex(ti->viewOf) && FindTex(ti->viewOf)->picture)) stereo = false;
     if (stereo != f.stereo || w != f.w || h != f.h) {
         // games that re-attach one framebuffer to other textures all the time (Rocketbirds) would fill the log
         static unsigned changes;
@@ -3223,7 +3239,11 @@ void TraceStep(Ctx* c)
         H = f->second.h;
     }
     if (W <= 0 || H <= 0) return;
-    std::vector<uint8_t> px((size_t)W * H * 4);
+    // the left eye, and the right-eye copy beside it when the target has one (a fault in one eye shows
+    // which pass caused it)
+    const GLuint fbs[2] = {RealFb(c, c->drawFb), RightFor(c, c->drawFb)};
+    const int eyes = fbs[1] ? 2 : 1;
+    std::vector<uint8_t> px((size_t)W * H * 4 * eyes);
     GLint pack = 0, align = 4, rowLen = 0;
     R.GetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
     if (pack) R.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
@@ -3231,27 +3251,31 @@ void TraceStep(Ctx* c)
     R.GetIntegerv(GL_PACK_ROW_LENGTH, &rowLen);
     R.PixelStorei(GL_PACK_ALIGNMENT, 4);
     R.PixelStorei(GL_PACK_ROW_LENGTH, 0);
-    R.BindFramebuffer(GL_READ_FRAMEBUFFER, RealFb(c, c->drawFb));
     GLint readBuf = 0;   // WineD3D leaves GL_NONE on its draw framebuffers
     R.GetIntegerv(GL_READ_BUFFER, &readBuf);
-    if (RealFb(c, c->drawFb)) R.ReadBuffer(GL_COLOR_ATTACHMENT0);
-    R.ReadPixels(0, 0, W, H, GL_BGRA, GL_UNSIGNED_BYTE, px.data());
+    for (int e = 0; e < eyes; ++e) {
+        R.BindFramebuffer(GL_READ_FRAMEBUFFER, fbs[e]);
+        if (fbs[e]) R.ReadBuffer(GL_COLOR_ATTACHMENT0);
+        R.ReadPixels(0, 0, W, H, GL_BGRA, GL_UNSIGNED_BYTE, px.data() + (size_t)W * H * 4 * e);
+    }
+    R.BindFramebuffer(GL_READ_FRAMEBUFFER, RealFb(c, c->drawFb));
     R.ReadBuffer((GLenum)readBuf);
     R.BindFramebuffer(GL_READ_FRAMEBUFFER, RealFb(c, c->readFb));
     R.PixelStorei(GL_PACK_ALIGNMENT, align);
     R.PixelStorei(GL_PACK_ROW_LENGTH, rowLen);
     if (pack) R.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
     const int s = (W + 639) / 640, ow = W / s, oh = H / s;
-    std::vector<uint8_t> small((size_t)ow * oh * 4);
-    for (int y = 0; y < oh; ++y)
-        for (int x = 0; x < ow; ++x) {
-            uint8_t* o = &small[((size_t)y * ow + x) * 4];
-            memcpy(o, &px[((size_t)(y * s) * W + (size_t)x * s) * 4], 4);
-            o[3] = 255;
-        }
+    std::vector<uint8_t> small((size_t)ow * eyes * oh * 4);
+    for (int e = 0; e < eyes; ++e)
+        for (int y = 0; y < oh; ++y)
+            for (int x = 0; x < ow; ++x) {
+                uint8_t* o = &small[((size_t)y * ow * eyes + (size_t)e * ow + x) * 4];
+                memcpy(o, &px[(size_t)W * H * 4 * e + ((size_t)(y * s) * W + (size_t)x * s) * 4], 4);
+                o[3] = 255;
+            }
     wchar_t name[64];
     swprintf_s(name, L"OGL3D_step%05u_%03u.bmp", g_frame, g_traceDraw - 1);
-    WriteBmp(ModuleDir() + name, ow, oh, small);
+    WriteBmp(ModuleDir() + name, ow * eyes, oh, small);
 }
 
 bool KeyDown(const Hotkey& k)
@@ -4496,6 +4520,95 @@ void GLAPIENTRY H_MultiDrawElementsIndirect(GLenum mode, GLenum type, const void
     StereoDraw([&] { R.MultiDrawElementsIndirect(mode, type, ind, n, stride); });
 }
 
+// Compute shaders (Unity post-processing through WineD3D: Blasphemous 2's cutscenes): a dispatch that writes
+// or reads a stereo texture runs again with the right-eye copies, or the right copy of what it writes keeps
+// whatever it held (the right eye turned pink). Images it writes get a right copy if they have none yet.
+void GLAPIENTRY H_BindImageTexture(GLuint unit, GLuint tex, GLint level, GLboolean layered, GLint layer, GLenum access,
+                                   GLenum format)
+{
+    R.BindImageTexture(unit, tex, level, layered, layer, access, format);
+    Ctx* c = t_ctx;
+    if (!c || unit >= 32) return;
+    c->images[unit] = Ctx::ImageUnit{tex, level, layer, layered, access, format};
+    c->maxImage = std::max(c->maxImage, (int)unit);
+}
+
+void GLAPIENTRY H_BindImageTextures(GLuint first, GLsizei count, const GLuint* textures)
+{
+    R.BindImageTextures(first, count, textures);
+    Ctx* c = t_ctx;
+    if (!c) return;
+    for (GLsizei i = 0; i < count && first + i < 32; ++i) {
+        // as the spec has it: level 0, all layers, read-write, the texture's format
+        c->images[first + i] = Ctx::ImageUnit{textures ? textures[i] : 0, 0, 0, GL_TRUE, GL_READ_WRITE, 0};
+        c->maxImage = std::max(c->maxImage, (int)(first + i));
+    }
+}
+
+static bool HasRight(GLuint tex)
+{
+    TexInfo* ti = tex ? FindTex(tex) : nullptr;
+    if (!ti) return false;
+    if (ti->right) return true;
+    TexInfo* oi = ti->viewOf ? FindTex(ti->viewOf) : nullptr;
+    return oi && oi->right;
+}
+
+template <class F>
+void StereoCompute(F&& dispatch)
+{
+    dispatch();
+    Ctx* c = t_ctx;
+    if (!c || c->listMode || !Active(c)) return;
+    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    bool stereo = false;
+    for (int u = 0; u <= c->maxImage && !stereo; ++u) stereo = HasRight(c->images[u].tex);
+    const uint32_t units = SampledUnits(c);
+    for (int u = 0; u <= c->maxUnit && !stereo; ++u)
+        if (UnitIn(units, u))
+            for (int s = 0; s < kSlotCount && !stereo; ++s) stereo = HasRight(c->bound[u][s]);
+    if (!stereo) return;
+    GLuint right[32] = {};
+    for (int u = 0; u <= c->maxImage; ++u) {
+        const Ctx::ImageUnit& im = c->images[u];
+        if (!im.tex) continue;
+        if (im.access != GL_READ_ONLY || HasRight(im.tex)) {
+            TexInfo* ti = FindTex(im.tex);
+            right[u] = TexClone(c, im.tex, ti ? ti->target : (GLenum)GL_TEXTURE_2D);
+        }
+    }
+    SwapTextures(c, true);
+    for (int u = 0; u <= c->maxImage; ++u) {
+        if (!right[u]) continue;
+        const Ctx::ImageUnit& im = c->images[u];
+        TexInfo* ti = FindTex(im.tex);
+        GLenum fmt = im.format ? im.format : ti ? (ti->viewOf ? ti->viewFmt : ti->ifmt) : (GLenum)GL_RGBA8;
+        R.BindImageTexture(u, right[u], im.level, im.layered, im.layer, im.access, fmt);
+    }
+    dispatch();
+    for (int u = 0; u <= c->maxImage; ++u) {
+        if (!right[u]) continue;
+        const Ctx::ImageUnit& im = c->images[u];
+        TexInfo* ti = FindTex(im.tex);
+        GLenum fmt = im.format ? im.format : ti ? (ti->viewOf ? ti->viewFmt : ti->ifmt) : (GLenum)GL_RGBA8;
+        R.BindImageTexture(u, im.tex, im.level, im.layered, im.layer, im.access, fmt);
+    }
+    SwapTextures(c, false);
+    static int logged;
+    if (logged++ < 3) Log("compute: a dispatch on stereo textures ran again for the right eye (program %u)", c->program);
+    g_stats.computeRight++;
+}
+
+void GLAPIENTRY H_DispatchCompute(GLuint x, GLuint y, GLuint z)
+{
+    StereoCompute([&] { R.DispatchCompute(x, y, z); });
+}
+
+void GLAPIENTRY H_DispatchComputeIndirect(GLintptr offset)
+{
+    StereoCompute([&] { R.DispatchComputeIndirect(offset); });
+}
+
 void GLAPIENTRY H_MultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei n)
 {
     t_drawMode = mode;
@@ -4634,6 +4747,11 @@ const HookEntry kHooks[] = {
     HOOK("glDrawElementsIndirect", H_DrawElementsIndirect, DrawElementsIndirect),
     HOOK("glMultiDrawArraysIndirect", H_MultiDrawArraysIndirect, MultiDrawArraysIndirect),
     HOOK("glMultiDrawElementsIndirect", H_MultiDrawElementsIndirect, MultiDrawElementsIndirect),
+    HOOK("glBindImageTexture", H_BindImageTexture, BindImageTexture),
+    HOOK("glBindImageTextureEXT", H_BindImageTexture, BindImageTexture),
+    HOOK("glBindImageTextures", H_BindImageTextures, BindImageTextures),
+    HOOK("glDispatchCompute", H_DispatchCompute, DispatchCompute),
+    HOOK("glDispatchComputeIndirect", H_DispatchComputeIndirect, DispatchComputeIndirect),
     HOOK("glMultiDrawArrays", H_MultiDrawArrays, MultiDrawArrays),
     HOOK("glMultiDrawArraysEXT", H_MultiDrawArrays, MultiDrawArrays),
     HOOK("glMultiDrawElements", H_MultiDrawElements, MultiDrawElements),
@@ -4945,10 +5063,10 @@ bool OnSwapBuffers(HDC dc)
     if (g_cfg.statsEvery > 0 && g_frame % g_cfg.statsEvery == 0) Log("last frames: %s", g_framePattern.c_str());
     if (g_frame <= 3 || (g_cfg.statsEvery > 0 && g_frame % g_cfg.statsEvery == 0)) {
         Log("frame %u: stereo draws %u, mono draws %u, clears %u, blits %u, copies %u, immediate %u, lists %u, "
-            "matrix-eye draws %u, uniform sets %u, flushes %u, finishes %u | shaders injected %u, failed %u, fbos %zu",
+            "matrix-eye draws %u, uniform sets %u, flushes %u, finishes %u, right-eye dispatches %u | shaders injected %u, failed %u, fbos %zu",
             g_frame, g_stats.stereoDraws, g_stats.monoDraws, g_stats.clears, g_stats.blits, g_stats.copies,
             g_stats.immediate, g_stats.lists, g_stats.matrixDraws, g_stats.uniformSets, g_stats.flushes,
-            g_stats.finishes, g_injectedCount, g_injectFailCount, c->fbo.size());
+            g_stats.finishes, g_stats.computeRight, g_injectedCount, g_injectFailCount, c->fbo.size());
     }
     g_stats = Stats{};
     g_frameConv = g_cfg.convergence;   // what the next frame will be rendered with
@@ -5079,11 +5197,36 @@ void WINAPI H_glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GL
     }
 }
 
+// A texture the game uploads into from the CPU is a picture, not a render target: a video frame (Blasphemous
+// 2's cutscenes upload Y, U and V planes the size of the window). It gets no right-eye copy, and loses one it
+// had: the copy was not kept up to date, and the right eye turned pink where the video was converted.
+void MarkPicture(GLenum target)
+{
+    Ctx* c = t_ctx;
+    int slot = SlotOf(target);
+    if (!c || slot < 0) return;
+    GLuint id = c->bound[c->activeUnit][slot];
+    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    TexInfo* ti = id ? FindTex(id) : nullptr;
+    if (!ti || ti->picture) return;
+    ti->picture = true;
+    bool had = ti->right != 0;
+    DeleteTexClone(*ti);
+    for (auto& kv : g_tex)
+        if (kv.second.viewOf == id && kv.second.right) {
+            DeleteTexClone(kv.second);
+            had = true;
+        }
+    for (auto& kv : c->fbo) kv.second.dirty = true;   // framebuffers it is attached to become mono
+    static int logged;
+    if (had && logged++ < 8) Log("texture %u (%dx%d) is uploaded from the CPU: a picture, no right-eye copy", id, ti->w, ti->h);
+}
+
 void WINAPI H_glTexSubImage2D(GLenum target, GLint level, GLint xo, GLint yo, GLsizei w, GLsizei h, GLenum format,
                               GLenum type, const void* pixels)
 {
     R.TexSubImage2D(target, level, xo, yo, w, h, format, type, pixels);
-    MirrorToClone(target, [&] { R.TexSubImage2D(target, level, xo, yo, w, h, format, type, pixels); });
+    MarkPicture(target);
 }
 
 void WINAPI H_glCopyTexImage2D(GLenum target, GLint level, GLenum ifmt, GLint x, GLint y, GLsizei w, GLsizei h,

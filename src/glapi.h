@@ -89,6 +89,9 @@ enum : GLenum {
     GL_RGBA = 0x1908,
     GL_BGRA = 0x80E1,
     GL_RGBA8 = 0x8058,
+    GL_FALSE = 0,
+    GL_TRUE = 1,
+    GL_READ_WRITE = 0x88BA,
     GL_SRGB = 0x8C40,
     GL_SRGB8_ALPHA8 = 0x8C43,
     GL_DEPTH_COMPONENT = 0x1902,
@@ -403,7 +406,12 @@ constexpr int kMaxUnits = 32;
     X(void, DrawArraysIndirect, (GLenum mode, const void* ind))                                      \
     X(void, DrawElementsIndirect, (GLenum mode, GLenum type, const void* ind))                       \
     X(void, MultiDrawArraysIndirect, (GLenum mode, const void* ind, GLsizei n, GLsizei stride))      \
-    X(void, MultiDrawElementsIndirect, (GLenum mode, GLenum type, const void* ind, GLsizei n, GLsizei stride))
+    X(void, MultiDrawElementsIndirect, (GLenum mode, GLenum type, const void* ind, GLsizei n, GLsizei stride))\
+    X(void, BindImageTexture, (GLuint unit, GLuint tex, GLint level, GLboolean layered, GLint layer,  \
+                               GLenum access, GLenum format))                                        \
+    X(void, BindImageTextures, (GLuint first, GLsizei count, const GLuint* textures))                \
+    X(void, DispatchCompute, (GLuint x, GLuint y, GLuint z))                                         \
+    X(void, DispatchComputeIndirect, (GLintptr offset))
 
 struct RealGL {
 #define S3D_DECL(ret, name, args) ret(GLAPIENTRY* name) args = nullptr;
