@@ -182,6 +182,23 @@ struct Ctx {
     float orderDepth = 0.0f;  // of the draw being issued
     float orderSlot = 0.0f;   // depth between neighbouring groups
     float drawPrims = 0.0f;   // triangles in the draw being issued (0 = unknown)
+    // order_weight: the part of its target each layer group covers, counted by an occlusion query around
+    // the draw (read back a frame or two later)
+    uint64_t measureKey = 0;  // group of the draw being issued, to be measured (0 = not measured)
+    struct CoverQuery {
+        GLuint q;
+        uint64_t key;
+        unsigned frame;
+        float area;           // samples that cover the whole target
+    };
+    std::vector<CoverQuery> coverPending;
+    std::vector<GLuint> coverFree;
+    struct Cover {
+        unsigned frame = 0;   // frame being summed
+        float sum = 0.0f;     // its draws so far
+        float value = -1.0f;  // the last whole frame (-1 = none yet)
+    };
+    std::unordered_map<uint64_t, Cover> keyCover;
     bool litRedraw = false;   // the draw being issued is a lit sprite: it reads a stereo target but keeps a depth
     std::vector<FlatEv> flatEvents;                    // this frame's draws
     struct FfBox {                                     // a fixed-function draw's extent (NDC) and layer
@@ -222,6 +239,7 @@ struct Ctx {
     std::unordered_map<GLuint, GLuint> texTarget;      // render texture -> the target it was drawn into as
     std::unordered_map<uint64_t, size_t> layoutPos;    // group key -> place in the last frame's composed picture
     size_t layoutCount = 0;                            // places in it (0 = far)
+    std::vector<float> layoutX;                        // order_weight: each place's position, 0 (far) .. 1 (near)
     size_t layoutPeak = 0;                             // the most places lately, and the frame it was last seen
     unsigned layoutPeakFrame = 0;
     GLuint layoutLastFb = 0;                           // target and place of the last known group drawn
@@ -345,6 +363,18 @@ std::unordered_map<GLuint, uint32_t> g_arbFpUnits; // ARB fragment program -> te
 #endif
 #ifndef GL_MAX_PROGRAM_ENV_PARAMETERS_ARB
 #define GL_MAX_PROGRAM_ENV_PARAMETERS_ARB 0x88B5
+#endif
+#ifndef GL_SAMPLES_PASSED
+#define GL_SAMPLES_PASSED 0x8914
+#endif
+#ifndef GL_CURRENT_QUERY
+#define GL_CURRENT_QUERY 0x8865
+#endif
+#ifndef GL_QUERY_RESULT
+#define GL_QUERY_RESULT 0x8866
+#endif
+#ifndef GL_QUERY_RESULT_AVAILABLE
+#define GL_QUERY_RESULT_AVAILABLE 0x8867
 #endif
 
 // Outputs of several vertex shader pieces of one program, each name once.
@@ -824,11 +854,16 @@ static bool UnitIn(uint32_t units, int u) { return u >= 32 ? units == ~0u : ((un
 
 // Order rule: depth of the k-th of n layers, 1 (first drawn, far) .. 0 (last); order_curve < 1 gives the
 // first layers (backgrounds, usually several parallax planes) more of the depth range
+float OrderX(float x)
+{
+    x = std::min(1.0f, std::max(0.0f, x));
+    return 1.0f - (g_cfg.flatOrderCurve == 1.0f ? x : std::pow(x, std::max(0.05f, g_cfg.flatOrderCurve)));
+}
+
 float OrderT(size_t k, size_t n)
 {
     if (n < 2) return 0.0f;
-    const float x = std::min(1.0f, (float)k / (float)(n - 1));
-    return 1.0f - (g_cfg.flatOrderCurve == 1.0f ? x : std::pow(x, std::max(0.05f, g_cfg.flatOrderCurve)));
+    return OrderX((float)k / (float)(n - 1));
 }
 
 // A fixed-function draw from client-side arrays (Machinarium): its extent on the screen and, when it puts a
@@ -1076,6 +1111,7 @@ void FeetDepthForDraw(Ctx* c)
 
 void OrderDepthForDraw(Ctx* c)
 {
+    c->measureKey = 0;
     FlatEv ev;
     ev.fb = LayoutTarget(c, c->drawFb);
     ev.prog = c->program;
@@ -1196,6 +1232,7 @@ void OrderDepthForDraw(Ctx* c)
         c->frameGroups++;
     }
     ev.key = c->groupKey;
+    c->measureKey = c->groupKey;
     c->flatEvents.push_back(ev);
     if (geom && c->ffBoxes.size() < 4096) {
         if (fg.mapped && !repeat) {
@@ -1207,23 +1244,31 @@ void OrderDepthForDraw(Ctx* c)
     }
     size_t g = c->frameGroups - 1;
     size_t n = std::max(c->lastGroupCount, c->frameGroups);
+    bool placed = false;                        // g is a place in the composed picture
     auto lt = c->layoutPos.find(c->groupKey);   // its place in the composed picture, when known
     if (lt != c->layoutPos.end()) {
         g = lt->second;
         n = c->layoutCount;
+        placed = true;
         if (ev.fb == c->layoutLastFb) c->layoutLastG = (long long)g;
     } else if (c->layoutCount > 1 && ev.fb == c->layoutLastFb && c->layoutLastG >= 0) {
         // not in the last frame's picture (an animated sprite shows another frame texture): right after
         // the group drawn before it into the same target, on the same scale as the known ones
         g = (size_t)std::min<long long>(c->layoutLastG + 1, (long long)c->layoutCount - 1);
         n = c->layoutCount;
+        placed = true;
     }
     if (lt != c->layoutPos.end() || ev.fb != c->layoutLastFb) {
         c->layoutLastFb = ev.fb;
         c->layoutLastG = lt != c->layoutPos.end() ? (long long)lt->second : -1;
     }
-    const float t = OrderT(g, n);
+    float t = OrderT(g, n);
     c->orderSlot = n > 1 ? (g > 0 ? OrderT(g - 1, n) - t : t - OrderT(1, n)) : 0.0f;
+    if (placed && c->layoutX.size() > 1) {   // order_weight: the place's measured position
+        const size_t m = c->layoutX.size(), k = std::min(g, m - 1);
+        t = OrderX(c->layoutX[k]);
+        c->orderSlot = k > 0 ? OrderX(c->layoutX[k - 1]) - t : t - OrderX(c->layoutX[1]);
+    }
     // smoothed while the group keeps being drawn; a group back after a pause (an animated sprite's
     // frame texture, shown again later) takes its depth right away, or it lags behind from long ago
     auto it = c->keyDepth.find(c->groupKey);
@@ -1258,8 +1303,46 @@ static void WalkLayout(const std::vector<FlatEv>& ev, const std::unordered_map<u
 }
 
 // At the end of a frame: the depth of each layer group from where it lands in the composed picture.
+// order_weight: how much of its target each measured group covered, from the queries that have finished
+static void ReadCover(Ctx* c)
+{
+    size_t keep = 0;
+    for (size_t i = 0; i < c->coverPending.size(); ++i) {
+        const Ctx::CoverQuery p = c->coverPending[i];
+        GLuint avail = 0;
+        R.GetQueryObjectuiv(p.q, GL_QUERY_RESULT_AVAILABLE, &avail);
+        if (!avail && g_frame - p.frame < 8) {
+            c->coverPending[keep++] = p;
+            continue;
+        }
+        if (avail) {   // (one not done after 8 frames is given up)
+            GLuint samples = 0;
+            R.GetQueryObjectuiv(p.q, GL_QUERY_RESULT, &samples);
+            Ctx::Cover& cv = c->keyCover[p.key];
+            if (cv.frame != p.frame) {
+                if (cv.frame) cv.value = cv.sum;
+                cv.frame = p.frame;
+                cv.sum = 0.0f;
+            }
+            cv.sum += (float)samples / p.area;
+        }
+        c->coverFree.push_back(p.q);
+    }
+    c->coverPending.resize(keep);
+    if (c->keyCover.size() > 8192) c->keyCover.clear();
+}
+
+// The part of its target a group covers (-1 = not measured)
+static float CoverOf(const Ctx* c, uint64_t key)
+{
+    auto it = c->keyCover.find(key);
+    if (it == c->keyCover.end()) return -1.0f;
+    return it->second.value >= 0.0f ? it->second.value : it->second.sum;
+}
+
 void ComputeLayout(Ctx* c)
 {
+    if (!c->coverPending.empty()) ReadCover(c);
     std::vector<FlatEv>& ev = c->flatEvents;
     c->pictures.clear();
     c->ffBoxes.clear();
@@ -1269,6 +1352,7 @@ void ComputeLayout(Ctx* c)
     c->ffObjects.clear();
     c->layoutPos.clear();
     c->layoutCount = 0;
+    c->layoutX.clear();
     if (ev.empty()) return;
     // A run of groups drawn again into another region of the same target (deferred lighting draws the
     // tiles once for colour, once for normals) repeats an earlier run: same program and draw counts.
@@ -1369,6 +1453,28 @@ void ComputeLayout(Ctx* c)
         auto it = c->layoutPos.find(a.second);
         if (it != c->layoutPos.end()) c->layoutPos.emplace(a.first, it->second);
     }
+    // order_weight: each layer steps forward by the part of the target it covers (at least order_weight),
+    // not one whole step: the props, effects and characters drawn one by one after a floor (Unity draws
+    // every sprite on its own) stay near that floor instead of taking a background layer's step each
+    // A plain colour over the whole target (a texture of a few pixels: a tint, a fade, a light buffer filled
+    // with ambient light) carries no picture: it takes the smallest step, or it pushes all other layers back.
+    if (g_cfg.flatOrderWeight > 0.0f && n > 1) {
+        c->layoutX.assign(n, 0.0f);
+        float sum = 0.0f;
+        for (size_t k = 1; k < n; ++k) {
+            float cv = CoverOf(c, order[k]);
+            if (cv >= 0.9f)
+                for (const FlatEv& e : ev)
+                    if (e.key == order[k]) {
+                        TexInfo* ti = e.tex ? FindTex(e.tex) : nullptr;
+                        if (ti && ti->w > 0 && ti->w * ti->h <= 16) cv = 0.0f;
+                        break;
+                    }
+            sum += cv < 0.0f ? 1.0f : std::min(1.0f, std::max(g_cfg.flatOrderWeight, cv));
+            c->layoutX[k] = sum;
+        }
+        for (float& x : c->layoutX) x /= sum;
+    }
     if (g_traceNow) {
         std::string s, comp;
         for (const FlatEv& e : ev) {   // composites and copies, to see where the walk stops
@@ -1386,9 +1492,13 @@ void ComputeLayout(Ctx* c)
         for (size_t k = 0; k < n; ++k) {
             for (const FlatEv& e : ev)
                 if (e.key == order[k]) {
-                    char buf[64];
+                    char buf[96];
                     sprintf_s(buf, " %zu:fb%u/p%u/t%u", k, e.fb, e.prog, e.tex);
                     s += buf;
+                    if (!c->layoutX.empty()) {
+                        sprintf_s(buf, "(cover %.3f x %.3f)", CoverOf(c, order[k]), c->layoutX[k]);
+                        s += buf;
+                    }
                     break;
                 }
         }
@@ -1612,6 +1722,46 @@ void SwapTextures(Ctx* c, bool toRight)
 
 void TraceStep(Ctx* c);
 
+// order_weight: count the samples the draw being issued writes (one eye), unless the game has a query of
+// its own running (WineD3D's occlusion queries)
+GLuint BeginCover(Ctx* c)
+{
+    if (g_cfg.flatOrderWeight <= 0.0f || !c->measureKey || !c->isMain || !R.BeginQuery || !R.GetQueryObjectuiv ||
+        c->coverPending.size() >= 2048)
+        return 0;
+    GLint cur = 0;
+    R.GetQueryiv(GL_SAMPLES_PASSED, GL_CURRENT_QUERY, &cur);
+    if (cur) return 0;
+    GLuint q = 0;
+    if (!c->coverFree.empty()) {
+        q = c->coverFree.back();
+        c->coverFree.pop_back();
+    } else {
+        R.GenQueries(1, &q);
+    }
+    if (q) R.BeginQuery(GL_SAMPLES_PASSED, q);
+    return q;
+}
+
+void EndCover(Ctx* c, GLuint q)
+{
+    if (!q) return;
+    R.EndQuery(GL_SAMPLES_PASSED);
+    int w = c->winW, h = c->winH;
+    if (c->drawFb) {
+        auto it = c->fbo.find(c->drawFb);
+        if (it != c->fbo.end()) {
+            w = it->second.w;
+            h = it->second.h;
+        }
+    }
+    if (w <= 0 || h <= 0) {
+        c->coverFree.push_back(q);
+        return;
+    }
+    c->coverPending.push_back({q, c->measureKey, g_frame, (float)w * (float)h});
+}
+
 template <class F>
 void StereoDraw(F&& draw)
 {
@@ -1645,6 +1795,7 @@ void StereoDraw(F&& draw)
     // fixed-function draws (their orthographic projection gets the offset)
     const bool fixedFn = !c->program && !c->arbActive && c->compat && g_cfg.fixedFunction;
     c->litRedraw = false;
+    c->measureKey = 0;
     if (((pi && pi->gs) || ((c->arbActive || fixedFn) && g_cfg.flatEnable)) && g_cfg.flatRule == 1 && c->isMain) OrderDepthForDraw(c);
     else if (fixedFn && g_cfg.flatEnable && g_cfg.flatRule == 0 && c->isMain) FeetDepthForDraw(c);
     if (pi && pi->gs && t_drawMode != GL_TRIANGLES && t_drawMode != GL_TRIANGLE_STRIP && t_drawMode != GL_TRIANGLE_FAN) {
@@ -1657,14 +1808,18 @@ void StereoDraw(F&& draw)
     EyeState st;
     if (!right) {
         EyeBegin(c, 0.0f, st);
+        const GLuint q = BeginCover(c);
         draw();
+        EndCover(c, q);
         g_stats.monoDraws++;
         TraceStep(c);
         return;
     }
     const float eye = mode == kModeMono ? 0.0f : 1.0f;   // mono: both eyes, no offset (screen depth)
     EyeBegin(c, -eye, st);
+    const GLuint q = BeginCover(c);
     draw();
+    EndCover(c, q);
     EyeEnd(st);
     R.BindFramebuffer(GL_DRAW_FRAMEBUFFER, right);
     SwapTextures(c, true);

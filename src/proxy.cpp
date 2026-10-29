@@ -158,6 +158,7 @@ void LoadConfig()
     c.flatCacheScale = IniFloat(L"Flat", L"cache_scale", c.flatCacheScale);
     c.flatGroupByDraw = _wcsicmp(IniStr(L"Flat", L"group", L"texture").c_str(), L"draw") == 0;
     c.flatOrderCurve = IniFloat(L"Flat", L"order_curve", c.flatOrderCurve);
+    c.flatOrderWeight = std::min(1.0f, std::max(0.0f, IniFloat(L"Flat", L"order_weight", c.flatOrderWeight)));
     c.flatSnap = IniInt(L"Flat", L"snap_pixels", c.flatSnap) != 0;
     c.silhouette.clear();
     {

@@ -388,6 +388,11 @@ constexpr int kMaxUnits = 32;
     X(void, ProgramEnvParameter4fARB, (GLenum target, GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w))\
     X(void, GetProgramivARB, (GLenum target, GLenum pname, GLint* params))                           \
     X(void, ClipControl, (GLenum origin, GLenum depth))                                              \
+    X(void, GenQueries, (GLsizei n, GLuint* ids))                                                    \
+    X(void, BeginQuery, (GLenum target, GLuint id))                                                  \
+    X(void, EndQuery, (GLenum target))                                                               \
+    X(void, GetQueryiv, (GLenum target, GLenum pname, GLint* params))                                \
+    X(void, GetQueryObjectuiv, (GLuint id, GLenum pname, GLuint* params))                            \
     X(void, TextureView, (GLuint tex, GLenum target, GLuint orig, GLenum ifmt, GLuint minLevel,      \
                           GLuint numLevels, GLuint minLayer, GLuint numLayers))                                                  \
     X(void, DrawArraysInstancedBaseInstance, (GLenum mode, GLint first, GLsizei count, GLsizei inst, GLuint bi))\
