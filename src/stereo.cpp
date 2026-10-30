@@ -2442,6 +2442,10 @@ void ApplyAutoConvergence(float nearDepth, int reliable, int ambiguous, int iden
     g_ac.lostRun = 0;
     if (!measured) return;
     g_ac.lostSteps = 0;
+    // Most of the picture on the screen plane: a scene of nearly one depth at the right convergence matches
+    // at offset 0 and counts as identical, and the few stray edges left would throw the convergence away
+    // (it then swung between the scene and a fraction of it, every second). Nothing to correct.
+    if (identical >= 20 && identical > 2 * (reliable + ambiguous)) return;
     const float estimate = nearDepth * (1.0f + g_cfg.autoPopout * 0.01f);
     g_ac.hist[g_ac.histPos] = std::log(estimate);
     g_ac.histPos = (g_ac.histPos + 1) % 5;
