@@ -70,13 +70,19 @@ bool PatchModuleImport(HMODULE m, const char* dll, const char* name, void* hook)
     if (!dir.VirtualAddress) return false;
     bool patched = false;
     for (auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; ++imp) {
-        if (_stricmp((const char*)(base + imp->Name), dll) != 0 || !imp->OriginalFirstThunk) continue;
-        auto names = (IMAGE_THUNK_DATA*)(base + imp->OriginalFirstThunk);
+        if (_stricmp((const char*)(base + imp->Name), dll) != 0) continue;
+        // Some exes (Runaway: The Dream of the Turtle) ship a name list that holds bound addresses, or none at
+        // all: such entries are not name RVAs, so match them by the address the slot already holds.
+        HMODULE target = GetModuleHandleA(dll);
+        ULONG_PTR addr = target ? (ULONG_PTR)GetProcAddress(target, name) : 0;
+        auto names = (IMAGE_THUNK_DATA*)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
         auto slots = (IMAGE_THUNK_DATA*)(base + imp->FirstThunk);
         for (; names->u1.AddressOfData; ++names, ++slots) {
             if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
-            auto byName = (IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData);
-            if (strcmp((const char*)byName->Name, name) != 0) continue;
+            if (imp->OriginalFirstThunk && names->u1.AddressOfData < nt->OptionalHeader.SizeOfImage) {
+                auto byName = (IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData);
+                if (strcmp((const char*)byName->Name, name) != 0) continue;
+            } else if (!addr || slots->u1.Function != addr) continue;
             DWORD old;
             if (VirtualProtect(&slots->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) {
                 slots->u1.Function = (ULONG_PTR)hook;

@@ -520,15 +520,18 @@ int PatchImports(HMODULE m, const IatHook* hooks, size_t hookCount)
     int patched = 0;
     for (auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; ++imp) {
         if (_stricmp((const char*)(base + imp->Name), "user32.dll") != 0) continue;
-        if (!imp->OriginalFirstThunk) continue;   // no name table: cannot match by name
-        auto names = (IMAGE_THUNK_DATA*)(base + imp->OriginalFirstThunk);
+        // A name list may hold bound addresses or be missing: then match by the address the slot holds.
+        HMODULE user32 = GetModuleHandleA("user32.dll");
+        auto names = (IMAGE_THUNK_DATA*)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
         auto slots = (IMAGE_THUNK_DATA*)(base + imp->FirstThunk);
         for (; names->u1.AddressOfData; ++names, ++slots) {
             if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
-            auto byName = (IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData);
+            bool named = imp->OriginalFirstThunk && names->u1.AddressOfData < nt->OptionalHeader.SizeOfImage;
+            auto byName = named ? (IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData) : nullptr;
             for (size_t k = 0; k < hookCount; ++k) {
                 const IatHook& h = hooks[k];
-                if (strcmp((const char*)byName->Name, h.name) != 0) continue;
+                if (byName ? strcmp((const char*)byName->Name, h.name) != 0
+                           : slots->u1.Function != (ULONG_PTR)GetProcAddress(user32, h.name)) continue;
                 DWORD old;
                 if (VirtualProtect(&slots->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) {
                     slots->u1.Function = (ULONG_PTR)h.hook;
