@@ -57,6 +57,25 @@ bool IsDepthStencilFormat(GLenum f)
     return f == GL_DEPTH_STENCIL || f == GL_DEPTH24_STENCIL8 || f == GL_DEPTH32F_STENCIL8;
 }
 
+// Block-compressed formats (S3TC, RGTC, BPTC, ETC2/EAC, ASTC and the generic GL_COMPRESSED_*): never a render
+// target, so a texture in one is a picture the game uploaded. WineD3D attaches such textures to its framebuffers
+// to upload and copy them, and a 16:9 sprite sheet looked like a stereo target: its right-eye clone made the
+// framebuffer GL_FRAMEBUFFER_UNSUPPORTED on Intel (NVIDIA let it pass), and the clone bound in the right eye showed
+// another picture than the original (Astral Ascent's sky on an Intel Arc GPU).
+bool IsCompressedFormat(GLenum f)
+{
+    return (f >= 0x83F0 && f <= 0x83F3) ||   // COMPRESSED_RGB(A)_S3TC_DXT1/3/5
+           (f >= 0x8C4C && f <= 0x8C4F) ||   // COMPRESSED_SRGB(_ALPHA)_S3TC
+           (f >= 0x8DBB && f <= 0x8DBE) ||   // RGTC (RED, SIGNED_RED, RG, SIGNED_RG)
+           (f >= 0x8E8C && f <= 0x8E8F) ||   // BPTC (BC7 UNORM / sRGB, BC6H signed / unsigned float)
+           (f >= 0x9270 && f <= 0x9279) ||   // ETC2 / EAC
+           (f >= 0x93B0 && f <= 0x93DD) ||   // ASTC
+           (f >= 0x84E9 && f <= 0x84EE) ||   // generic COMPRESSED_ALPHA ... COMPRESSED_RGBA
+           f == 0x8225 || f == 0x8226 ||     // COMPRESSED_RED, COMPRESSED_RG
+           f == 0x8C48 || f == 0x8C49 ||     // COMPRESSED_SRGB, COMPRESSED_SRGB_ALPHA
+           f == 0x86B0 || f == 0x86B1;       // COMPRESSED_RGB_FXT1_3DFX, COMPRESSED_RGBA_FXT1_3DFX
+}
+
 struct TexInfo {
     GLenum target = 0;
     GLsizei w = 0, h = 0;
@@ -505,7 +524,7 @@ GLuint TexClone(Ctx* c, GLuint id, GLenum targetHint)
         ti = &(g_tex[id] = q);
     }
     if (ti->right) return ti->right;
-    if (ti->picture) return 0;
+    if (ti->picture || IsCompressedFormat(ti->ifmt) || (ti->viewOf && IsCompressedFormat(ti->viewFmt))) return 0;
     if (ti->viewOf) {
         // the same view of the original's clone
         TexInfo* oi = FindTex(ti->viewOf);
@@ -676,11 +695,14 @@ GLuint RightFor(Ctx* c, GLuint fb)
     for (int i = 0; i < kAttCount && !sized; ++i)
         if (f.att[i].kind) sized = AttSize(c, f.att[i], w, h);
     bool stereo = sized && (IsStereoSize(c, w, h) || f.promoted);
-    // a picture the game uploads (video frames, converted in such a framebuffer) stays one picture
+    // a picture the game uploads (video frames, converted in such a framebuffer; block-compressed sprite sheets
+    // WineD3D attaches to upload or copy them) stays one picture
     for (int i = 0; i < kMaxColorAttachments && stereo; ++i)
         if (f.att[i].kind == GL_TEXTURE)
             if (TexInfo* ti = FindTex(f.att[i].id))
-                if (ti->picture || (ti->viewOf && FindTex(ti->viewOf) && FindTex(ti->viewOf)->picture)) stereo = false;
+                if (ti->picture || IsCompressedFormat(ti->ifmt) || (ti->viewOf && IsCompressedFormat(ti->viewFmt)) ||
+                    (ti->viewOf && FindTex(ti->viewOf) && FindTex(ti->viewOf)->picture))
+                    stereo = false;
     if (stereo != f.stereo || w != f.w || h != f.h) {
         // games that re-attach one framebuffer to other textures all the time (Rocketbirds) would fill the log
         static unsigned changes;
@@ -721,7 +743,37 @@ GLuint RightFor(Ctx* c, GLuint fb)
     R.ReadBuffer(f.readBuf);
     R.BindFramebuffer(GL_READ_FRAMEBUFFER, RealFb(c, c->readFb));
     if (st != GL_FRAMEBUFFER_COMPLETE) {
-        Log("fbo %u: right-eye copy incomplete (0x%x), drawing it mono", fb, st);
+        // what the copy was made of, so a driver that refuses it (Intel: GL_FRAMEBUFFER_UNSUPPORTED) can be diagnosed
+        std::string what;
+        for (int i = 0; i < kAttCount; ++i) {
+            const Att& a = f.att[i];
+            if (!a.kind) continue;
+            char buf[240];
+            if (a.kind == GL_TEXTURE) {
+                TexInfo* ti = FindTex(a.id);
+                TexInfo* oi = ti && ti->viewOf ? FindTex(ti->viewOf) : nullptr;
+                sprintf_s(buf, " [%d] tex %u (target 0x%x, %dx%d, fmt 0x%x, levels %d, samples %d, %s%s%u) level %d layer %d -> clone %u",
+                          i, a.id, ti ? ti->target : a.textarget, ti ? ti->w : -1, ti ? ti->h : -1, ti ? ti->ifmt : 0u, ti ? ti->levels : -1,
+                          ti ? ti->samples : -1, ti && ti->immutable ? "immutable" : "mutable", ti && ti->viewOf ? ", view of " : ", view of none ",
+                          ti ? ti->viewOf : 0u, a.level, a.layer, ti ? ti->right : 0u);
+                what += buf;
+                if (oi) {
+                    sprintf_s(buf, " (viewfmt 0x%x of tex %u fmt 0x%x levels %d clone %u)", ti->viewFmt, ti->viewOf, oi->ifmt, oi->levels, oi->right);
+                    what += buf;
+                }
+            } else {
+                auto it = g_rb.find(a.id);
+                sprintf_s(buf, " [%d] rb %u (%dx%d, fmt 0x%x, samples %d) -> clone %u", i, a.id, it != g_rb.end() ? it->second.w : -1,
+                          it != g_rb.end() ? it->second.h : -1, it != g_rb.end() ? it->second.ifmt : 0u, it != g_rb.end() ? it->second.samples : -1,
+                          it != g_rb.end() ? it->second.right : 0u);
+                what += buf;
+            }
+        }
+        char bufs[96] = "";
+        for (GLsizei i = 0; i < f.nDrawBufs; ++i) sprintf_s(bufs + strlen(bufs), sizeof(bufs) - strlen(bufs), " 0x%x", f.drawBufs[i]);
+        static unsigned logged;
+        if (++logged <= 40 || logged % 1000 == 0)
+            Log("fbo %u: right-eye copy incomplete (0x%x), drawing it mono; attachments:%s; draw buffers:%s read 0x%x", fb, st, what.c_str(), bufs, f.readBuf);
         f.stereo = false;
         return 0;
     }
