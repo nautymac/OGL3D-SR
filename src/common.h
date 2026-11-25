@@ -56,6 +56,8 @@ struct Config {
     Hotkey keyShowValues{VK_F1, true};
     Hotkey keyAutoConv{VK_F2, true};
     Hotkey keyHunt{VK_F9, true}, keyHuntPrev{VK_F10, true}, keyHuntNext{VK_F11, true}, keyHuntMode{VK_F8, true};
+    bool gamepad = true;          // XInput controller: L1+R1+D-pad up/down = separation, right/left = convergence
+    bool autoSave = true;         // save separation/convergence when an adjustment key (keyboard or pad) is released
     // [SR]
     int srLatencyFrames = 1;
     bool srWeaverHwnd = true;

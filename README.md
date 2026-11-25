@@ -53,6 +53,8 @@ Run games at the panel's native resolution (for example 3840×2160), fullscreen 
 | Ctrl+F5 / Ctrl+F6 | convergence − / + (switches auto-convergence off) |
 | Ctrl+F2 | auto-convergence on/off |
 | Ctrl+F7 | save separation, convergence and shader choices to `OGL3D.ini` |
+| Controller: hold L1+R1 + D-pad | up / down = separation + / −, right / left = convergence + / − (XInput pads; `gamepad = 0` turns it off) |
+| (auto) | releasing an adjustment key or the controller combo saves the values like Ctrl+F7 (`auto_save = 0`: only Ctrl+F7 saves) |
 | Ctrl+F1 | keep the values on screen (otherwise they show only while you adjust) |
 | Ctrl+T | 3D on/off |
 | Ctrl+Alt+W | SR weaving on/off (off shows side-by-side) |

@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <Xinput.h>   // types only: XInputGetState is looked up at run time (no import)
 
 namespace {
 
@@ -1892,6 +1893,50 @@ std::wstring KeyName(const Hotkey& k)
     return s + buf;
 }
 
+// ---- XInput controller: L1+R1 held + D-pad -------------------------------------------------
+// XInputGetState comes from whichever XInput DLL the system has, loaded on first use, so the proxy does not
+// import it (the game may never touch a controller). Polling an empty slot is slow (it asks the driver every
+// time), so empty slots are looked at again only every 2 seconds.
+struct PadDirs {
+    bool sepUp, sepDown, convUp, convDown;
+};
+
+PadDirs PollPad()
+{
+    using GetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+    static GetStateFn getState = [] {
+        for (const wchar_t* dll : {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"})
+            if (HMODULE m = LoadLibraryW(dll))
+                if (auto f = (GetStateFn)GetProcAddress(m, "XInputGetState")) {
+                    Log("gamepad: %ls (L1+R1+D-pad adjusts separation/convergence)", dll);
+                    return f;
+                }
+        Log("gamepad: no XInput DLL, controller adjustment off");
+        return (GetStateFn) nullptr;
+    }();
+    PadDirs d{};
+    if (!getState) return d;
+    static ULONGLONG retryAt[XUSER_MAX_COUNT] = {};
+    const ULONGLONG now = GetTickCount64();
+    WORD buttons = 0;
+    for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
+        if (retryAt[i] > now) continue;
+        XINPUT_STATE st{};
+        if (getState(i, &st) != ERROR_SUCCESS) {
+            retryAt[i] = now + 2000;
+            continue;
+        }
+        buttons |= st.Gamepad.wButtons;
+    }
+    const WORD shoulders = XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER;
+    if ((buttons & shoulders) != shoulders) return d;
+    d.sepUp = (buttons & XINPUT_GAMEPAD_DPAD_UP) != 0;
+    d.sepDown = (buttons & XINPUT_GAMEPAD_DPAD_DOWN) != 0;
+    d.convUp = (buttons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0;
+    d.convDown = (buttons & XINPUT_GAMEPAD_DPAD_LEFT) != 0;
+    return d;
+}
+
 std::wstring ValuesText()
 {
     wchar_t buf[128];
@@ -1994,9 +2039,10 @@ void PollHotkeys(float dt)
     static bool pSave, pToggle, pDump, pWeave, pShow, pHunt, pPrev, pNext, pMode, pAuto, adjusting;
     const bool ko = KoreanUi();
     bool changed = false;
-    if (KeyDown(g_cfg.keySepUp)) g_cfg.separation = std::min(200.0f, g_cfg.separation + 25.0f * dt), changed = true;
-    if (KeyDown(g_cfg.keySepDown)) g_cfg.separation = std::max(0.0f, g_cfg.separation - 25.0f * dt), changed = true;
-    const bool convUp = KeyDown(g_cfg.keyConvUp), convDown = KeyDown(g_cfg.keyConvDown);
+    const PadDirs pad = g_cfg.gamepad ? PollPad() : PadDirs{};
+    if (KeyDown(g_cfg.keySepUp) || pad.sepUp) g_cfg.separation = std::min(200.0f, g_cfg.separation + 25.0f * dt), changed = true;
+    if (KeyDown(g_cfg.keySepDown) || pad.sepDown) g_cfg.separation = std::max(0.0f, g_cfg.separation - 25.0f * dt), changed = true;
+    const bool convUp = KeyDown(g_cfg.keyConvUp) || pad.convUp, convDown = KeyDown(g_cfg.keyConvDown) || pad.convDown;
     if ((convUp || convDown) && g_cfg.autoConvergence) {
         g_cfg.autoConvergence = false;   // adjusting by hand takes over from auto
         Log("auto convergence off (manual adjustment)");
@@ -2016,11 +2062,8 @@ void PollHotkeys(float dt)
         adjusting = true;
         OsdMessage(ValuesText(), 2.5);
         if (g_cfg.showValues) UpdateStatus();
-    } else if (adjusting) {
-        adjusting = false;
-        Log("separation %.2f%% convergence %.4f", g_cfg.separation, g_cfg.convergence);
     }
-    if (Pressed(g_cfg.keySave, pSave)) {
+    auto saveAndShow = [] {
         SaveStereoValues();
         // always English (user preference), whatever the Windows UI language
         wchar_t buf[200];
@@ -2032,7 +2075,13 @@ void PollHotkeys(float dt)
             msg += buf;
         }
         OsdMessage(msg, 3.0);
+    };
+    if (!changed && adjusting) {
+        adjusting = false;
+        Log("separation %.2f%% convergence %.4f", g_cfg.separation, g_cfg.convergence);
+        if (g_cfg.autoSave) saveAndShow();   // the key (or pad combo) was released: keep the last value
     }
+    if (Pressed(g_cfg.keySave, pSave)) saveAndShow();
     if (Pressed(g_cfg.keyToggle, pToggle)) {
         g_cfg.enable = !g_cfg.enable;
         g_paramVer++;
