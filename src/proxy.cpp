@@ -198,6 +198,8 @@ void LoadConfig()
     c.keyHuntPrev = ParseKey(IniStr(L"Keys", L"hunt_prev", L""), c.keyHuntPrev);
     c.keyHuntNext = ParseKey(IniStr(L"Keys", L"hunt_next", L""), c.keyHuntNext);
     c.keyHuntMode = ParseKey(IniStr(L"Keys", L"hunt_mode", L""), c.keyHuntMode);
+    c.gamepad = IniInt(L"Keys", L"gamepad", c.gamepad) != 0;
+    c.autoSave = IniInt(L"Keys", L"auto_save", c.autoSave) != 0;
     c.swallowKeys = IniInt(L"Keys", L"swallow", c.swallowKeys) != 0;
     c.showValues = IniInt(L"Overlay", L"show_values", c.showValues) != 0;
     c.cursor = IniInt(L"Overlay", L"cursor", c.cursor) != 0;
