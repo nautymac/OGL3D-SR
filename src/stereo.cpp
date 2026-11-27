@@ -2031,6 +2031,33 @@ void HuntCycleMode()
     UpdateStatus();
 }
 
+// Separation / convergence keys and L1+R1+D-pad move the value in steps, as geo-11's keys do: one step when
+// pressed (a tap is one step), then after 0.4 s held one every 0.1 s, and after 3 s held one every 0.03 s.
+constexpr float kSepStep = 1.0f;     // separation, percent
+constexpr float kConvStep = 1.02f;   // convergence, factor
+struct AdjustKey {
+    float held = -1.0f, next = 0.0f;
+    int Steps(bool down, float dt)
+    {
+        if (!down) {
+            held = -1.0f;
+            return 0;
+        }
+        if (held < 0.0f) {
+            held = 0.0f;
+            next = 0.4f;
+            return 1;
+        }
+        held += dt;
+        int n = 0;
+        while (held >= next) {
+            ++n;
+            next += held > 3.0f ? 0.03f : 0.1f;
+        }
+        return n;
+    }
+};
+
 void PollHotkeys(float dt)
 {
     DWORD pid = 0;
@@ -2040,15 +2067,18 @@ void PollHotkeys(float dt)
     const bool ko = KoreanUi();
     bool changed = false;
     const PadDirs pad = g_cfg.gamepad ? PollPad() : PadDirs{};
-    if (KeyDown(g_cfg.keySepUp) || pad.sepUp) g_cfg.separation = std::min(200.0f, g_cfg.separation + 25.0f * dt), changed = true;
-    if (KeyDown(g_cfg.keySepDown) || pad.sepDown) g_cfg.separation = std::max(0.0f, g_cfg.separation - 25.0f * dt), changed = true;
-    const bool convUp = KeyDown(g_cfg.keyConvUp) || pad.convUp, convDown = KeyDown(g_cfg.keyConvDown) || pad.convDown;
-    if ((convUp || convDown) && g_cfg.autoConvergence) {
+    static AdjustKey sepUpKey, sepDownKey, convUpKey, convDownKey;
+    const bool sepUpDown = KeyDown(g_cfg.keySepUp) || pad.sepUp, sepDownDown = KeyDown(g_cfg.keySepDown) || pad.sepDown;
+    const bool convUpDown = KeyDown(g_cfg.keyConvUp) || pad.convUp, convDownDown = KeyDown(g_cfg.keyConvDown) || pad.convDown;
+    const bool holding = sepUpDown || sepDownDown || convUpDown || convDownDown;
+    if (const int n = sepUpKey.Steps(sepUpDown, dt)) g_cfg.separation = std::min(200.0f, g_cfg.separation + kSepStep * n), changed = true;
+    if (const int n = sepDownKey.Steps(sepDownDown, dt)) g_cfg.separation = std::max(0.0f, g_cfg.separation - kSepStep * n), changed = true;
+    const int convUp = convUpKey.Steps(convUpDown, dt), convDown = convDownKey.Steps(convDownDown, dt);
+    if ((convUpDown || convDownDown) && g_cfg.autoConvergence) {
         g_cfg.autoConvergence = false;   // adjusting by hand takes over from auto
         Log("auto convergence off (manual adjustment)");
     }
-    if (convUp) g_cfg.convergence *= std::exp(0.7f * dt), changed = true;
-    if (convDown) g_cfg.convergence *= std::exp(-0.7f * dt), changed = true;
+    if (convUp || convDown) g_cfg.convergence *= std::pow(kConvStep, (float)(convUp - convDown)), changed = true;
     if (Pressed(g_cfg.keyAutoConv, pAuto)) {
         g_cfg.autoConvergence = !g_cfg.autoConvergence;
         Log("auto convergence %s", g_cfg.autoConvergence ? "on" : "off");
@@ -2076,7 +2106,7 @@ void PollHotkeys(float dt)
         }
         OsdMessage(msg, 3.0);
     };
-    if (!changed && adjusting) {
+    if (!holding && adjusting) {
         adjusting = false;
         Log("separation %.2f%% convergence %.4f", g_cfg.separation, g_cfg.convergence);
         if (g_cfg.autoSave) saveAndShow();   // the key (or pad combo) was released: keep the last value
